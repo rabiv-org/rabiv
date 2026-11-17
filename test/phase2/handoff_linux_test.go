@@ -220,7 +220,7 @@ func fixture(id string, issued time.Time) v1.DecisionRecord {
 	// Only this opt-in test executable can generate synthetic ALLOW.
 	d := digest()
 	ref := func(id string) *artifact.ObjectReference { return &artifact.ObjectReference{ID: id, Digest: d} }
-	expires := issued.Add(time.Minute)
+	expires := issued.Add(3 * time.Minute)
 	return v1.DecisionRecord{SchemaVersion: v1.SchemaVersion, Kind: v1.KindDecisionRecord, Decision: decision.Decision{
 		DecisionID: id, WorkflowID: "wf-lab", Build: build.Context{Identity: identity(), PipelineID: "3", Source: &build.SourceRevision{RepositoryURI: "https://gitlab.example/repo.git", CommitSHA: strings.Repeat("b", 40)}},
 		Verdict: decision.Allow, Assessment: decision.Assessment{Sufficiency: decision.Sufficient, Compliance: decision.Satisfied, Trust: decision.TrustRequirementsMet}, Reasons: []decision.ReasonCode{decision.RequiredChecksPassed}, IssuedAt: issued, ExpiresAt: &expires,
@@ -660,7 +660,7 @@ func TestVMDecisionHandoff(t *testing.T) {
 		helper(t, run, cfg, "V", "write-many", "concurrent", map[string]string{"RABIV_VMTEST_ISSUED": issued})
 	})
 	t.Run("expired_snapshot", func(t *testing.T) {
-		old := time.Now().UTC().Add(-2 * time.Minute).Format(time.RFC3339Nano)
+		old := time.Now().UTC().Add(-4 * time.Minute).Format(time.RFC3339Nano)
 		expired := resultRef(t, helper(t, run, cfg, "V", "put", "expired", map[string]string{"RABIV_VMTEST_ISSUED": old}))
 		helper(t, run, cfg, "P+", "check", "expired", map[string]string{"RABIV_VMTEST_REF": refJSON(t, expired), "RABIV_VMTEST_ERROR": "freshness"})
 	})
