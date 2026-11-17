@@ -117,8 +117,7 @@ type SourceRevision struct {
 // Validate rejects credential-bearing repository URIs and abbreviated commits.
 func (s SourceRevision) Validate() error {
 	u, err := url.Parse(s.RepositoryURI)
-	if err != nil || !u.IsAbs() || u.Opaque != "" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.ContainsAny(s.RepositoryURI, "\r\n\t ") {
-		return fmt.Errorf("invalid repository URI")
+	if err != nil || !u.IsAbs() || u.Opaque != "" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || strings.ContainsRune(s.RepositoryURI, '#') || strings.ContainsAny(s.RepositoryURI, "\r\n\t ") {
 	}
 	if (len(s.CommitSHA) != 40 && len(s.CommitSHA) != 64) || !lowerHex(s.CommitSHA) {
 		return fmt.Errorf("invalid full commit SHA")
