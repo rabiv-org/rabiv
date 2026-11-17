@@ -70,6 +70,7 @@ can be selected per invocation without changing project tooling:
 ```bash
 export GOCACHE=/tmp/rabiv-phase2-go-cache
 export GOLANGCI_LINT_CACHE=/tmp/rabiv-phase2-lint-cache
+
 make fmt-check
 go test ./...
 go vet ./...
@@ -79,6 +80,7 @@ make build
 make vuln
 go mod verify
 go mod tidy -diff
+
 bash -n test/phase2/run-vm-security.sh
 ```
 
@@ -94,12 +96,32 @@ Default inspection should show the VM file only among ignored files, not compile
 tests; tagged inspection includes it. Build alone does not execute VM preflight:
 
 ```bash
-mkdir -p /tmp/rabiv-phase2-bundle
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/rabiv-phase2-bundle/rabiv-verifier ./cmd/rabiv-verifier
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/rabiv-phase2-bundle/rabiv-publisher ./cmd/rabiv-publisher
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test -tags=rabiv_vmtest -c ./test/phase2 -o /tmp/rabiv-phase2-bundle/handoff.test
-cp test/phase2/run-vm-security.sh /tmp/rabiv-phase2-bundle/
-sha256sum /tmp/rabiv-phase2-bundle/*
+B=/tmp/rabiv-phase2-bundle
+mkdir -p "$B"
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+  go build -o "$B/rabiv-verifier" ./cmd/rabiv-verifier
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+  go build -o "$B/rabiv-publisher" ./cmd/rabiv-publisher
+
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+  go test -tags=rabiv_vmtest -c ./test/phase2 \
+  -o "$B/handoff.test"
+
+cp test/phase2/run-vm-security.sh "$B/"
+
+(
+  cd "$B" || exit 1
+
+  sha256sum \
+    rabiv-verifier \
+    rabiv-publisher \
+    handoff.test \
+    run-vm-security.sh > SHA256SUMS
+
+  sha256sum -c SHA256SUMS
+)
 ```
 
 These static Linux/amd64 artifacts do not require installing a new Go on the VM.
@@ -112,17 +134,118 @@ Codex prepares the implementation/bundle; the owner performs privileged executio
 using interactive sudo. Do not give passwords to an agent or bypass sudo through
 Docker group membership/privileged containers. Do not alter Arch/libvirt settings.
 
-Verify the upload target is guest-local storage. Example owner transfer/invocation
-(strict SSH host-key verification remains enabled):
+### Secure bundle transfer
+
+Use a fresh private upload directory instead of a predictable pre-existing path.
+The upload directory must reside on guest-local storage. Strict SSH host-key
+verification remains enabled.
+
+Replace `USER`, `VM_HOST` and `PATH_TO_SSH_KEY` with the appropriate values.
+
+**On the development host:**
 
 ```bash
-ssh -F /dev/null -i ~/.ssh/id_ed25519_ubuntu -o BatchMode=yes -o StrictHostKeyChecking=yes -o UpdateHostKeys=no k1mhoangg@192.168.122.99 'mkdir -p /var/tmp/rabiv-phase2-upload'
-scp -F /dev/null -i ~/.ssh/id_ed25519_ubuntu -o StrictHostKeyChecking=yes -o UpdateHostKeys=no /tmp/rabiv-phase2-bundle/* k1mhoangg@192.168.122.99:/var/tmp/rabiv-phase2-upload/
-ssh -t -F /dev/null -i ~/.ssh/id_ed25519_ubuntu -o StrictHostKeyChecking=yes -o UpdateHostKeys=no k1mhoangg@192.168.122.99 'sudo bash /var/tmp/rabiv-phase2-upload/run-vm-security.sh --confirm-dedicated-vm /var/tmp/rabiv-phase2-upload'
+B=/tmp/rabiv-phase2-bundle
+VM="USER@VM_HOST"
+SSH_KEY="PATH_TO_SSH_KEY"
+
+SSH_OPTS=(
+  -F /dev/null
+  -i "$SSH_KEY"
+  -o BatchMode=yes
+  -o StrictHostKeyChecking=yes
+  -o UpdateHostKeys=no
+)
+
+UPLOAD=$(ssh "${SSH_OPTS[@]}" "$VM" \
+  'mktemp -d /var/tmp/rabiv-phase2-upload.XXXXXXXX')
+
+printf 'Upload directory: %s\n' "$UPLOAD"
+
+scp "${SSH_OPTS[@]}" \
+  "$B"/{rabiv-verifier,rabiv-publisher,handoff.test,run-vm-security.sh,SHA256SUMS} \
+  "$VM:$UPLOAD/"
 ```
+
+`mktemp -d` creates a fresh private directory with mode `0700`. Do not replace
+it with `mkdir -p` on a predictable upload path.
+
+The upload must succeed before proceeding. Keep the exact `UPLOAD` path displayed
+by the command for the next step.
+
+### Owner verification and privileged execution
+
+**On the Ubuntu VM:**
+
+Set `UPLOAD` to the actual path printed on the development host.
+
+```bash
+UPLOAD="/var/tmp/rabiv-phase2-upload.ACTUAL_SUFFIX"
+
+cd "$UPLOAD"
+
+findmnt -T "$UPLOAD" -o TARGET,FSTYPE,OPTIONS
+sha256sum -c SHA256SUMS
+```
+
+Verify that the upload resides on guest-local storage and that all four
+checksums report `OK`. Stop if any verification fails.
+
+Install the reviewed bundle into a newly created, root-owned private directory:
+
+```bash
+REVIEWED=$(sudo mktemp -d \
+  /var/lib/rabiv-phase2-reviewed.XXXXXXXX)
+
+sudo install -o root -g root -m 0555 \
+  "$UPLOAD/rabiv-verifier" \
+  "$UPLOAD/rabiv-publisher" \
+  "$UPLOAD/handoff.test" \
+  "$UPLOAD/run-vm-security.sh" \
+  "$REVIEWED/"
+
+sudo install -o root -g root -m 0444 \
+  "$UPLOAD/SHA256SUMS" \
+  "$REVIEWED/SHA256SUMS"
+```
+
+The reviewed directory is root-owned and mode `0700`. The unprivileged upload
+user cannot modify its contents.
+
+Verify the exact files that will be executed:
+
+```bash
+sudo sh -c '
+  cd "$1" &&
+  sha256sum -c SHA256SUMS
+' sh "$REVIEWED"
+```
+
+All checksums must report `OK`. Do not continue on a mismatch.
+
+Run the reviewed script using interactive sudo:
+
+```bash
+sudo bash \
+  "$REVIEWED/run-vm-security.sh" \
+  --confirm-dedicated-vm \
+  "$REVIEWED"
+
+echo "Exit code: $?"
+```
+
+**Security requirements:**
+
+- Never execute uploaded scripts directly as root from user-writable directories.
+- Never trust an existing predictable upload directory without verification.
+- Do not use Docker privileges to bypass interactive sudo.
+- Do not execute the test suite on the Arch development host.
+- The owner must verify the source, transferred bundle and execution environment.
+- Preserve the generated acceptance report for code review.
 
 `-F /dev/null` avoids the observed host SSH configuration permission problem; it
 does not disable known-host checking. No private key contents should be printed.
+
 If missing, the owner may install `acl` on the guest before running; the script
 does not install packages automatically. It does not inspect credentials or stop
 Docker, Runner, Tetragon, or existing RABIV accounts/services.
