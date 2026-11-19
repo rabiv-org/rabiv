@@ -19,6 +19,21 @@ import (
 // Version versions only intermediate acquisition records, not contracts/v1.
 const Version = "acquisition/v1"
 
+// InputError carries only a sanitized acquisition outcome across adapter ports.
+type InputError struct{ Code v1.FailureCode }
+
+func (e *InputError) Error() string { return "acquisition input failure: " + string(e.Code) }
+
+// Failure preserves invalid/unsupported/unavailable distinctions without copying
+// provider response bodies, credentials, signed URLs or arbitrary error text.
+func Failure(err error) *v1.Failure {
+	var input *InputError
+	if errors.As(err, &input) && (v1.Failure{Code: input.Code}).Validate() == nil {
+		return &v1.Failure{Code: input.Code}
+	}
+	return &v1.Failure{Code: v1.ProducerError}
+}
+
 // Source returns a bounded, independently hashed snapshot of exact object bytes.
 type Source interface {
 	Get(context.Context, artifact.ObjectReference, int64) ([]byte, error)
