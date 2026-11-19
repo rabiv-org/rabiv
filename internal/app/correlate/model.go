@@ -75,6 +75,7 @@ type Capture struct {
 	Gaps        []evidence.Gap             `json:"gaps"`
 	Diagnostics []Diagnostic               `json:"diagnostics"`
 	Interrupted bool                       `json:"interrupted"`
+	Dropped     uint64                     `json:"dropped"`
 }
 
 // Validate checks captured metadata, never runtime coverage or identity trust.

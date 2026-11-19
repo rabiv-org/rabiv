@@ -3,8 +3,10 @@
 package tetragon
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/netip"
 	"time"
 
@@ -14,6 +16,33 @@ import (
 )
 
 var ErrRecord = errors.New("malformed or unsupported Tetragon record")
+
+// Stream reads an explicitly supplied export descriptor without accessing
+// privileged control sockets, installing policies or requesting credentials.
+type Stream struct {
+	reader  io.ReadCloser
+	scanner *bufio.Scanner
+	max     int64
+}
+
+func NewStream(r io.ReadCloser, maxRecord int64) (*Stream, error) {
+	if r == nil || maxRecord <= 0 || maxRecord > 16<<20 {
+		return nil, ErrRecord
+	}
+	s := bufio.NewScanner(r)
+	s.Buffer(make([]byte, 4096), int(maxRecord))
+	return &Stream{reader: r, scanner: s, max: maxRecord}, nil
+}
+func (s *Stream) Close() error { return s.reader.Close() }
+func (s *Stream) Next() (correlate.Event, error) {
+	if !s.scanner.Scan() {
+		if s.scanner.Err() != nil {
+			return correlate.Event{}, io.ErrUnexpectedEOF
+		}
+		return correlate.Event{}, io.EOF
+	}
+	return Normalize(s.scanner.Bytes(), s.max)
+}
 
 type process struct {
 	ExecID string `json:"exec_id"`

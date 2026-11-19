@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/rabiv-org/rabiv/internal/app/acquire"
+	"github.com/rabiv-org/rabiv/internal/app/collect"
 	"github.com/rabiv-org/rabiv/internal/app/correlate"
 	"github.com/rabiv-org/rabiv/internal/domain/build"
 	"github.com/rabiv-org/rabiv/internal/platform/jsoninput"
@@ -187,7 +188,7 @@ type Stream struct {
 	scanner *bufio.Scanner
 }
 
-func (c *Client) Events(ctx context.Context) (*Stream, error) {
+func (c *Client) Events(ctx context.Context) (collect.LifecycleStream, error) {
 	filter := url.QueryEscape(`{"type":["container"]}`)
 	r, err := c.get(ctx, "/v"+c.version+"/events?filters="+filter)
 	if err != nil {
@@ -205,7 +206,7 @@ func (s *Stream) Close() error { return s.body.Close() }
 func (s *Stream) Next() (correlate.Container, error) {
 	if !s.scanner.Scan() {
 		if s.scanner.Err() != nil {
-			return correlate.Container{}, ErrInput
+			return correlate.Container{}, io.ErrUnexpectedEOF
 		}
 		return correlate.Container{}, io.EOF
 	}
