@@ -104,14 +104,14 @@ func Capture(parent context.Context, c CaptureConfig, docker Docker, runtime Run
 	ready := false
 	add := func(v any) bool {
 		b, e := json.Marshal(v)
-		if e != nil || used+int64(len(b)) > c.MaxBytes || records >= c.MaxRecords {
+		if e != nil || used+int64(len(b))+1 > c.MaxBytes || records >= c.MaxRecords {
 			r.Interrupted = true
 			r.Dropped++
 			gaps[evidence.ObservationInterrupted] = true
 			counts["CAPTURE_LIMIT"]++
 			return false
 		}
-		used += int64(len(b))
+		used += int64(len(b)) + 1
 		records++
 		return true
 	}

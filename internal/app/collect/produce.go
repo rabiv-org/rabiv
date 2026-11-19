@@ -32,6 +32,17 @@ func Produce(ctx context.Context, source acquire.Source, sink acquire.Sink, capt
 	if selected == nil {
 		return zero, errors.New("target job is not supplied")
 	}
+	if selected.ValidateComplete() != nil {
+		m := v1.EvidenceManifest{ManifestHeader: v1.ManifestHeader{SchemaVersion: v1.SchemaVersion, Kind: v1.KindEvidenceManifest, ManifestID: id, WorkflowID: workflow, Build: *selected, RecordedAt: at, State: v1.Failed, Failure: &v1.Failure{Code: v1.InputUnavailable}}}
+		if e := m.Validate(); e != nil {
+			return zero, e
+		}
+		b, e := json.Marshal(m)
+		if e != nil {
+			return zero, e
+		}
+		return sink.Put(ctx, id, bytes.NewReader(b), 1<<20)
+	}
 	b, err := source.Get(ctx, captureRef, maxCapture)
 	if err != nil {
 		return zero, err

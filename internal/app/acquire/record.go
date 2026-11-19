@@ -47,12 +47,13 @@ type Sink interface {
 // Job is a fetched GitLab metadata snapshot, with independently acquired archive.
 // An absent archive with a Failure is a terminal acquisition outcome, not DENY.
 type Job struct {
-	Version    string                    `json:"version"`
-	Build      build.Context             `json:"build"`
-	Metadata   *artifact.ObjectReference `json:"metadata,omitempty"`
-	Archive    *artifact.ObjectReference `json:"archive,omitempty"`
-	Failure    *v1.Failure               `json:"failure,omitempty"`
-	RecordedAt time.Time                 `json:"recorded_at"`
+	Version            string                    `json:"version"`
+	ArtifactsRequested bool                      `json:"artifacts_requested"`
+	Build              build.Context             `json:"build"`
+	Metadata           *artifact.ObjectReference `json:"metadata,omitempty"`
+	Archive            *artifact.ObjectReference `json:"archive,omitempty"`
+	Failure            *v1.Failure               `json:"failure,omitempty"`
+	RecordedAt         time.Time                 `json:"recorded_at"`
 }
 
 // Validate does not authenticate the fetcher, CI claims, or referenced bytes.
@@ -62,6 +63,18 @@ func (j Job) Validate() error {
 	}
 	if j.Metadata != nil && j.Metadata.Validate() != nil {
 		return errors.New("invalid metadata reference")
+	}
+	if !j.ArtifactsRequested {
+		if j.Archive != nil {
+			return errors.New("metadata-only handoff contains an archive")
+		}
+		if j.Failure != nil {
+			return j.Failure.Validate()
+		}
+		if j.Metadata == nil || j.Build.ValidateComplete() != nil {
+			return errors.New("incomplete CI metadata handoff")
+		}
+		return nil
 	}
 	if j.Archive != nil {
 		if j.Failure != nil || j.Metadata == nil || j.Build.ValidateComplete() != nil {

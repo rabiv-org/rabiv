@@ -35,8 +35,12 @@ var (
 // Each other producer and each consumer has its own nonroot UID. ReaderGID is a
 // dedicated supplementary group, never shared-group write authorization.
 type Config struct {
-	RootDir                                                      string
-	WriterUID, WriterGID, ReaderUID, ReaderPrimaryGID, ReaderGID int
+	RootDir          string `json:"root_dir"`
+	WriterUID        int    `json:"writer_uid"`
+	WriterGID        int    `json:"writer_gid"`
+	ReaderUID        int    `json:"reader_uid"`
+	ReaderPrimaryGID int    `json:"reader_primary_gid"`
+	ReaderGID        int    `json:"reader_gid"`
 }
 
 // Store pins an already provisioned local channel. It never initializes a layout.
