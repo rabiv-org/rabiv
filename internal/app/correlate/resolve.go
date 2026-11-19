@@ -25,6 +25,7 @@ type AttributedEvent struct {
 	ScopeID         string `json:"scope_id,omitempty"`
 	JobID           string `json:"job_id,omitempty"`
 	ProcessObserved bool   `json:"process_observed"`
+	ParentObserved  bool   `json:"parent_observed"`
 }
 
 // Result is metadata consistency, not proof of runtime coverage or build causality.
@@ -87,6 +88,30 @@ func Resolve(c Capture, targets []build.Context) (Result, error) {
 	}
 	candidates := map[string]*candidate{}
 	knownIDs := map[string]bool{}
+	claims := map[string]Container{}
+	blocked := map[string]bool{}
+	// Enrich only observations with the same full ID and actual start timestamp.
+	// Conflicting nonempty labels invalidate that epoch; missing labels do not.
+	for _, o := range c.Containers {
+		if o.StartedAt == nil {
+			continue
+		}
+		key := scopeID(c, o)
+		previous, exists := claims[key]
+		if !exists {
+			claims[key] = o
+			continue
+		}
+		for _, pair := range [][2]*string{{&previous.JobID, &o.JobID}, {&previous.ProjectID, &o.ProjectID}, {&previous.PipelineID, &o.PipelineID}, {&previous.CommitSHA, &o.CommitSHA}, {&previous.RawRole, &o.RawRole}} {
+			if *pair[0] != "" && *pair[1] != "" && *pair[0] != *pair[1] {
+				blocked[key] = true
+			}
+			if *pair[0] == "" {
+				*pair[0] = *pair[1]
+			}
+		}
+		claims[key] = previous
+	}
 	for _, o := range c.Containers {
 		knownIDs[o.ID] = true
 		if o.StartedAt == nil {
@@ -94,6 +119,18 @@ func Resolve(c Capture, targets []build.Context) (Result, error) {
 			counts["RUNTIME_START_UNAVAILABLE"]++
 			continue
 		}
+		key := scopeID(c, o)
+		if blocked[key] {
+			gaps[evidence.AmbiguousScope] = true
+			counts["CONTRADICTORY_SCOPE_METADATA"]++
+			continue
+		}
+		known := claims[key]
+		o.JobID = known.JobID
+		o.ProjectID = known.ProjectID
+		o.PipelineID = known.PipelineID
+		o.CommitSHA = known.CommitSHA
+		o.RawRole = known.RawRole
 		var matches []build.Context
 		for _, t := range targets {
 			if o.JobID == t.Identity.JobID && o.ProjectID == t.Identity.ProjectID {
@@ -146,7 +183,16 @@ func Resolve(c Capture, targets []build.Context) (Result, error) {
 	processes := map[string]int{}
 	conflicts := map[string]bool{}
 	for _, e := range c.Events {
+		if e.NativeKind == "process_throttle" {
+			gaps[evidence.ObservationInterrupted] = true
+			counts["THROTTLE_OBSERVED"]++
+		}
 		a := AttributedEvent{Event: e, Resolution: "UNRESOLVED"}
+		if e.Kind == SourceLoss {
+			a.Resolution = "SOURCE_REPORT"
+			r.Events = append(r.Events, a)
+			continue
+		}
 		if e.ContainerID == "" {
 			a.Resolution = "NO_CONTAINER_ID"
 			gaps[evidence.UnresolvedScope] = true
@@ -195,6 +241,10 @@ func Resolve(c Capture, targets []build.Context) (Result, error) {
 	}
 	for i := range r.Events {
 		a := &r.Events[i]
+		if a.Event.Kind == SourceLoss {
+			counts["SOURCE_LOSS_REPORT"]++
+			continue
+		}
 		if a.Event.Kind == Unsupported {
 			counts["UNSUPPORTED_EVENT_KIND"]++
 			continue
@@ -204,6 +254,9 @@ func Resolve(c Capture, targets []build.Context) (Result, error) {
 		} else {
 			gaps[evidence.ScopeMetadataUnavailable] = true
 			counts["PROCESS_EXEC_UNOBSERVED_OR_AMBIGUOUS"]++
+		}
+		if p, ok := processes[a.Event.ParentExecID]; a.Event.ParentExecID != "" && ok && !conflicts[a.Event.ParentExecID] && !a.Event.At.Before(r.Events[p].Event.At) {
+			a.ParentObserved = true
 		}
 	}
 	if len(r.Scopes) == 0 {

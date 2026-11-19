@@ -18,7 +18,7 @@ func TestProfileProperties(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(args, "\n")
-	for _, required := range []string{"User=41001", "SupplementaryGroups=41002 41003", "NoNewPrivileges=yes", "CapabilityBoundingSet=", "AmbientCapabilities=", "PrivateNetwork=yes", "RestrictAddressFamilies=AF_UNIX", "ProtectSystem=strict", "ProtectHome=yes", "PrivateTmp=yes", "ReadOnlyPaths=/var/lib/example/fetch", "ReadWritePaths=/var/lib/example/work /var/lib/example/result", "InaccessiblePaths=/var/lib/example/decisions /etc/example/credentials -/run -/var/run", "MemoryMax=1073741824", "KillMode=control-group"} {
+	for _, required := range []string{"User=41001", "SupplementaryGroups=41002 41003", "NoNewPrivileges=yes", "CapabilityBoundingSet=", "AmbientCapabilities=", "PrivateNetwork=yes", "RestrictAddressFamilies=AF_UNIX", "ProtectSystem=strict", "ProtectHome=yes", "PrivateTmp=yes", "ReadOnlyPaths=/var/lib/example/fetch /tmp /var/tmp", "ReadWritePaths=/var/lib/example/work /var/lib/example/result", "InaccessiblePaths=/var/lib/example/decisions /etc/example/credentials -/run -/var/run", "MemoryMax=1073741824", "KillMode=control-group"} {
 		if !strings.Contains(joined, "--property="+required+"\n") {
 			t.Fatalf("missing property %s", required)
 		}

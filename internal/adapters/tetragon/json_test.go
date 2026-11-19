@@ -2,6 +2,7 @@ package tetragon
 
 import (
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 
@@ -34,5 +35,25 @@ func TestNativeProfile(t *testing.T) {
 		if _, err := Normalize([]byte(raw), 4096); err == nil {
 			t.Fatal("accepted malformed record")
 		}
+	}
+}
+
+func TestLossReportsAndTruncatedStream(t *testing.T) {
+	for _, count := range []string{`"7"`, `7`, `"0"`} {
+		raw := `{"time":"2026-01-02T03:04:05Z","rate_limit_info":{"number_of_dropped_process_events":` + count + `}}`
+		e, err := Normalize([]byte(raw), 4096)
+		if err != nil || e.Kind != correlate.SourceLoss || e.LossCount == nil {
+			t.Fatalf("loss hidden: %+v %v", e, err)
+		}
+	}
+	s, err := NewStream(io.NopCloser(strings.NewReader("{\n")), 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Next(); err == nil {
+		t.Fatal("truncated JSON accepted")
+	}
+	if _, err = s.Next(); err != io.EOF {
+		t.Fatal("stream EOF lost")
 	}
 }

@@ -161,7 +161,7 @@ loop:
 				if ctx.Err() == nil {
 					r.Interrupted = true
 					gaps[evidence.ObservationInterrupted] = true
-					terminal = errors.New("Tetragon stream ended")
+					terminal = errors.New("tetragon stream ended")
 				}
 				break loop
 			}
@@ -174,7 +174,7 @@ loop:
 				break loop
 			}
 			r.Events = append(r.Events, m.value)
-			if !ready && m.value.Kind != correlate.Unsupported {
+			if !ready && m.value.Kind != correlate.Unsupported && m.value.Kind != correlate.SourceLoss {
 				ready = true
 				if c.Ready != nil {
 					c.Ready()

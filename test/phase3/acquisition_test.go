@@ -192,3 +192,38 @@ func TestFetchWorkerFinalizeAndNegativeBindings(t *testing.T) {
 		t.Fatal("missing worker treated as ready")
 	}
 }
+
+func TestEmptyProvenanceIsAvailableButMalformed(t *testing.T) {
+	var b bytes.Buffer
+	z := zip.NewWriter(&b)
+	for name, data := range map[string]string{"out/subject": "bytes", "artifacts-metadata.json": ""} {
+		w, e := z.Create(name)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if _, e = io.WriteString(w, data); e != nil {
+			t.Fatal(e)
+		}
+	}
+	if e := z.Close(); e != nil {
+		t.Fatal(e)
+	}
+	ctx := context.Background()
+	fetch, out := &channel{}, &channel{}
+	id := build.Identity{Provider: build.GitLab, Instance: "https://ci.example", ProjectID: "5", JobID: "27"}
+	r, e := ingest.Fetch(ctx, ci{b.Bytes()}, fetch, "fetch", id, time.Now().UTC(), 1<<20)
+	if e != nil {
+		t.Fatal(e)
+	}
+	workerRef, e := ingest.Process(ctx, fetch, out, zipadapter.Reader{Limits: zipadapter.Limits{Archive: 1 << 20, Entry: 1 << 18, Expanded: 1 << 19, Entries: 16, Ratio: 100}, ProvenanceEntry: "artifacts-metadata.json"}, scanner{}, provadapter.Parser{}, r, "worker", []string{"out/subject"}, 1<<20, 1<<20)
+	if e != nil {
+		t.Fatal(e)
+	}
+	result, e := ingest.DecodeWorker(out.data[workerRef.ID])
+	if e != nil {
+		t.Fatal(e)
+	}
+	if result.ProvenanceRaw == nil || result.ProvenanceRaw.Digest != acquire.Hash(nil) || result.Provenance != nil || !slices.Contains(result.Issues, "PROVENANCE_MALFORMED") || slices.Contains(result.Issues, "PROVENANCE_MISSING") {
+		t.Fatalf("empty metadata conflated with absence: %+v", result)
+	}
+}

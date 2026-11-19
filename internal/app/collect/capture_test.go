@@ -134,3 +134,36 @@ func TestProduceStrictManifestWithUnknownCoverage(t *testing.T) {
 		}
 	}
 }
+
+func TestReportedLossDoesNotBecomeZeroLossOrComplete(t *testing.T) {
+	ctx := context.Background()
+	m := &memory{data: map[string][]byte{}}
+	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	job := build.Context{Identity: build.Identity{Provider: build.GitLab, Instance: "https://ci.example", ProjectID: "6", JobID: "12"}, PipelineID: "91", Source: &build.SourceRevision{RepositoryURI: "https://ci.example/team/project", CommitSHA: strings.Repeat("a", 40)}}
+	for _, count := range []uint64{0, 7} {
+		c := correlate.Capture{Version: "runtime-capture/v1", CaptureID: "capture", HostID: "host", BootID: "boot", Window: evidence.ObservationWindow{From: at, Until: at}, Containers: []correlate.Container{}, Events: []correlate.Event{{Kind: correlate.SourceLoss, At: at, Source: "TETRAGON", LossCount: &count}}, Gaps: []evidence.Gap{}, Diagnostics: []correlate.Diagnostic{}}
+		b, e := json.Marshal(c)
+		if e != nil {
+			t.Fatal(e)
+		}
+		r, e := m.Put(ctx, "capture", bytes.NewReader(b), 1<<20)
+		if e != nil {
+			t.Fatal(e)
+		}
+		ref, e := Produce(ctx, m, m, r, []build.Context{job}, job.Identity, "workflow", "manifest", at, 1<<20)
+		if e != nil {
+			t.Fatal(e)
+		}
+		manifest, e := v1.DecodeEvidenceManifest(m.data[ref.ID])
+		if e != nil {
+			t.Fatal(e)
+		}
+		want := evidence.LossUnknown
+		if count > 0 {
+			want = evidence.LossReported
+		}
+		if manifest.Payload.EventLoss.Status != want || manifest.Payload.Coverage.Status != evidence.CoverageUnknown {
+			t.Fatal("loss/coverage uncertainty lost")
+		}
+	}
+}

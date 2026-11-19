@@ -99,13 +99,13 @@ func (c *CLI) Scan(parent context.Context, data []byte, digest artifact.Digest) 
 	if err != nil {
 		return nil, ErrScan
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	info, err := r.Stat(".")
 	if err != nil || !info.IsDir() || info.Mode().Perm() != 0700 || int(info.Sys().(*syscall.Stat_t).Uid) != os.Geteuid() {
 		return nil, ErrScan
 	}
 	name := "subject-" + rand.Text()
-	config := "config-" + rand.Text()
+	config := "config-" + rand.Text() + ".yaml"
 	write := func(name string, b []byte) error {
 		f, e := r.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 		if e != nil {
@@ -121,7 +121,7 @@ func (c *CLI) Scan(parent context.Context, data []byte, digest artifact.Digest) 
 	ctx, cancel := context.WithTimeout(parent, c.cfg.Timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, c.cfg.Binary, "--config", filepath.Join(c.cfg.Workspace, config), "scan", "file:"+filepath.Join(c.cfg.Workspace, name), "--parallelism", "1", "-o", "syft-json")
-	cmd.Env = []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8", "HOME=/nonexistent", "XDG_CONFIG_HOME=/nonexistent", "SYFT_CHECK_FOR_APP_UPDATE=false", "GOMAXPROCS=2"}
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8", "HOME=/nonexistent", "XDG_CONFIG_HOME=/nonexistent", "SYFT_CHECK_FOR_APP_UPDATE=false", "GOMAXPROCS=2", "TMPDIR=" + c.cfg.Workspace}
 	cmd.Dir = c.cfg.Workspace
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
 	cmd.Cancel = func() error {

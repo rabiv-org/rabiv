@@ -8,6 +8,8 @@ import (
 	"errors"
 	"io"
 	"net/netip"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rabiv-org/rabiv/internal/app/correlate"
@@ -30,7 +32,7 @@ func NewStream(r io.ReadCloser, maxRecord int64) (*Stream, error) {
 		return nil, ErrRecord
 	}
 	s := bufio.NewScanner(r)
-	s.Buffer(make([]byte, 4096), int(maxRecord))
+	s.Buffer(make([]byte, min(4096, int(maxRecord))), int(maxRecord))
 	return &Stream{reader: r, scanner: s, max: maxRecord}, nil
 }
 func (s *Stream) Close() error { return s.reader.Close() }
@@ -85,8 +87,8 @@ func Normalize(data []byte, maxRecord int64) (correlate.Event, error) {
 	}
 	result := correlate.Event{At: at, Source: "TETRAGON", Kind: correlate.Unsupported}
 	selected := ""
-	for _, k := range []string{"process_exec", "process_exit", "process_kprobe"} {
-		if v, ok := raw[k]; ok && string(v) != "null" {
+	for k, v := range raw {
+		if (strings.HasPrefix(k, "process_") || k == "rate_limit_info") && string(v) != "null" {
 			if selected != "" {
 				return zero, ErrRecord
 			}
@@ -94,6 +96,25 @@ func Normalize(data []byte, maxRecord int64) (correlate.Event, error) {
 		}
 	}
 	if selected == "" {
+		return result, nil
+	}
+	result.NativeKind = selected
+	if selected == "rate_limit_info" {
+		var loss struct {
+			Count json.Number `json:"number_of_dropped_process_events"`
+		}
+		if json.Unmarshal(raw[selected], &loss) != nil {
+			return zero, ErrRecord
+		}
+		count, e := strconv.ParseUint(string(loss.Count), 10, 64)
+		if e != nil {
+			return zero, ErrRecord
+		}
+		result.Kind = correlate.SourceLoss
+		result.LossCount = &count
+		return result, nil
+	}
+	if selected != "process_exec" && selected != "process_exit" && selected != "process_kprobe" {
 		return result, nil
 	}
 	var e event

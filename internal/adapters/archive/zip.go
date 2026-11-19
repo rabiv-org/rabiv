@@ -100,7 +100,7 @@ func (r Reader) Read(ctx context.Context, data []byte, names []string) (ingest.C
 		if e != nil {
 			return nil, ErrArchive
 		}
-		defer src.Close()
+		defer func() { _ = src.Close() }()
 		b, e := acquire.ReadLimit(src, l.Entry)
 		if e != nil || uint64(len(b)) != f.UncompressedSize64 {
 			return nil, ErrArchive
@@ -115,12 +115,14 @@ func (r Reader) Read(ctx context.Context, data []byte, names []string) (ingest.C
 		result.Subjects = append(result.Subjects, ingest.SubjectBytes{Name: name, Bytes: b})
 	}
 	if r.ProvenanceEntry != "" && seen[r.ProvenanceEntry] != nil {
+		result.ProvenancePresent = true
 		result.Provenance, err = read(r.ProvenanceEntry)
 		if err != nil || len(result.Provenance) > 1<<20 {
 			return result, ErrArchive
 		}
 	}
 	if r.SBOMEntry != "" && seen[r.SBOMEntry] != nil {
+		result.SBOMPresent = true
 		result.ExistingSBOM, err = read(r.SBOMEntry)
 		if err != nil {
 			return result, err

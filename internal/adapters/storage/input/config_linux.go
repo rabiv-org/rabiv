@@ -20,12 +20,12 @@ func LoadConfig(path string) (Config, error) {
 	if err != nil {
 		return c, err
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	f, err := openFile(r, filepath.Base(path), os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return c, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	i, err := f.Stat()
 	if err != nil || !i.Mode().IsRegular() || i.Mode().Perm()&0022 != 0 || i.Sys().(*syscall.Stat_t).Uid != 0 {
 		return c, ErrUnsafe

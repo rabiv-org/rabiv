@@ -115,7 +115,7 @@ func (c *Client) metadata(ctx context.Context, path string, out any) error {
 	if err != nil {
 		return err
 	}
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 	if r.StatusCode != http.StatusOK {
 		return ErrUnavailable
 	}
@@ -219,14 +219,17 @@ func (c *Client) Artifacts(ctx context.Context, id build.Identity) ([]byte, erro
 				return nil, ErrRedirect
 			}
 			next = u.ResolveReference(next)
-			decoded, _ := url.QueryUnescape(next.String())
+			decoded, decodeErr := url.QueryUnescape(next.String())
+			if decodeErr != nil {
+				return nil, ErrRedirect
+			}
 			if len(c.token) > 0 && (strings.Contains(next.String(), string(c.token)) || strings.Contains(decoded, string(c.token))) {
 				return nil, ErrRedirect
 			}
 			current = next.String()
 			continue
 		case http.StatusOK:
-			defer r.Body.Close()
+			defer func() { _ = r.Body.Close() }()
 			if r.ContentLength > c.cfg.MaxArchive || r.Header.Get("Content-Encoding") != "" && r.Header.Get("Content-Encoding") != "identity" {
 				return nil, ErrInvalid
 			}

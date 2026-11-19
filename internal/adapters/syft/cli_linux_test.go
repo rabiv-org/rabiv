@@ -46,7 +46,7 @@ func TestCLIEnvironmentBytesAndCleanup(t *testing.T) {
 			t.Fatal("wrong subject bytes")
 		}
 		b, e = os.ReadFile(cmd.Args[2])
-		if e != nil || string(b) != "{}\n" {
+		if e != nil || string(b) != "{}\n" || !strings.HasSuffix(cmd.Args[2], ".yaml") {
 			t.Fatal("ambient scanner config")
 		}
 		_, e = io.WriteString(cmd.Stdout, sbom(digest.Value))

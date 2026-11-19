@@ -20,7 +20,7 @@ import (
 // The output object retains unresolved events and original capture reference.
 func Produce(ctx context.Context, source acquire.Source, sink acquire.Sink, captureRef artifact.ObjectReference, targets []build.Context, job build.Identity, workflow, id string, at time.Time, maxCapture int64) (artifact.ObjectReference, error) {
 	var zero artifact.ObjectReference
-	if job.Validate() != nil || artifact.ValidateID(workflow) != nil || artifact.ValidateID(id+".evidence") != nil || build.ValidateTime(at) != nil {
+	if job.Validate() != nil || artifact.ValidateID(id) != nil || artifact.ValidateID(workflow) != nil || artifact.ValidateID(id+".evidence") != nil || build.ValidateTime(at) != nil {
 		return zero, errors.New("invalid evidence production request")
 	}
 	var selected *build.Context
@@ -71,6 +71,11 @@ func Produce(ctx context.Context, source acquire.Source, sink acquire.Sink, capt
 	p := &evidence.Bundle{Reference: ref, Scopes: []build.ExecutionScope{}, Observations: []evidence.ScopeObservation{}, ObservationWindow: &c.Window, Coverage: evidence.ObservationCoverage{Status: evidence.CoverageUnknown}, EventLoss: evidence.EventLoss{Status: evidence.LossUnknown}, Gaps: append([]evidence.Gap{}, r.Gaps...)}
 	if c.Dropped > 0 {
 		p.EventLoss = evidence.EventLoss{Status: evidence.LossReported, Count: &c.Dropped, Source: "LOCAL_CAPTURE_LIMIT"}
+	}
+	for _, e := range c.Events {
+		if e.Kind == correlate.SourceLoss && e.LossCount != nil && *e.LossCount > 0 {
+			p.EventLoss = evidence.EventLoss{Status: evidence.LossReported, Source: "CAPTURE_REPORTS"}
+		}
 	}
 	counts := map[string]uint64{}
 	for _, e := range r.Events {

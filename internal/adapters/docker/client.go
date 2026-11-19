@@ -25,7 +25,7 @@ import (
 	"github.com/rabiv-org/rabiv/internal/platform/jsoninput"
 )
 
-var ErrInput = errors.New("Docker metadata unavailable or malformed")
+var ErrInput = errors.New("docker metadata unavailable or malformed")
 
 // Config has no Docker-host environment fallback or daemon mutation operation.
 type Config struct {
@@ -88,7 +88,7 @@ func (c *Client) read(ctx context.Context, path string, limit int64) ([]byte, er
 	if err != nil {
 		return nil, err
 	}
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 	b, err := acquire.ReadLimit(r.Body, limit)
 	if err != nil {
 		return nil, ErrInput
@@ -195,7 +195,7 @@ func (c *Client) Events(ctx context.Context) (collect.LifecycleStream, error) {
 		return nil, err
 	}
 	s := bufio.NewScanner(r.Body)
-	s.Buffer(make([]byte, 4096), int(c.cfg.MaxRecord))
+	s.Buffer(make([]byte, min(4096, int(c.cfg.MaxRecord))), int(c.cfg.MaxRecord))
 	return &Stream{body: r.Body, scanner: s}, nil
 }
 

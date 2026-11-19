@@ -212,7 +212,7 @@ func openFile(r *os.Root, name string, flags int, mode uint32) (*os.File, error)
 	if err != nil {
 		return nil, err
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 	fd, err := syscall.Openat(int(d.Fd()), name, flags|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, mode)
 	if err != nil {
 		return nil, err
@@ -237,7 +237,7 @@ func (s *Store) Get(ctx context.Context, ref artifact.ObjectReference, limit int
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
 	if err != nil {
 		return nil, err
@@ -263,7 +263,7 @@ func (s *Store) syncDir(r *os.Root) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	return s.sync(f)
 }
 

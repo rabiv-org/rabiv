@@ -119,7 +119,7 @@ func Load(path string) (Config, error) {
 	if e != nil {
 		return c, e
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	b, e := acquire.ReadLimit(f, 64<<10)
 	if e != nil || jsoninput.Decode(b, &c, true) != nil {
 		return c, ErrIsolation
@@ -143,7 +143,7 @@ func (c Config) Arguments(profile, unit string, args []string) ([]string, error)
 		"NoNewPrivileges=yes", "CapabilityBoundingSet=", "AmbientCapabilities=", "PrivateNetwork=yes", "RestrictAddressFamilies=AF_UNIX", "IPAddressDeny=any",
 		"ProtectSystem=strict", "ProtectHome=yes", "PrivateTmp=yes", "PrivateDevices=yes", "PrivateMounts=yes", "ProtectKernelTunables=yes", "ProtectKernelModules=yes", "ProtectKernelLogs=yes", "ProtectControlGroups=yes", "ProtectClock=yes", "ProtectHostname=yes",
 		"RestrictNamespaces=yes", "RestrictRealtime=yes", "RestrictSUIDSGID=yes", "LockPersonality=yes", "MemoryDenyWriteExecute=yes", "ProtectProc=invisible", "ProcSubset=pid", "SystemCallArchitectures=native", "UMask=0077",
-		"ReadOnlyPaths=" + c.FetchRoot, "ReadWritePaths=" + c.Workspace + " " + c.ResultRoot,
+		"ReadOnlyPaths=" + c.FetchRoot + " /tmp /var/tmp", "ReadWritePaths=" + c.Workspace + " " + c.ResultRoot,
 		"InaccessiblePaths=" + c.DecisionRoot + " " + strings.Join(c.CredentialPaths, " ") + " -/run -/var/run",
 		fmt.Sprintf("MemoryMax=%d", c.MemoryBytes), "MemorySwapMax=0", fmt.Sprintf("CPUQuota=%d%%", c.CPUPercent), fmt.Sprintf("TasksMax=%d", c.Tasks), fmt.Sprintf("RuntimeMaxSec=%d", c.TimeoutSeconds), "TimeoutStopSec=5s", "KillMode=control-group",
 		"Description=" + unit,

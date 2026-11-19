@@ -60,8 +60,8 @@ func (Parser) Parse(data []byte, ref artifact.ObjectReference) (*domain.Referenc
 	// Keep raw claims available even when the supported projection is incomplete.
 	var predicate map[string]json.RawMessage
 	var envelope map[string]json.RawMessage
-	if json.Unmarshal(data, &envelope) != nil || json.Unmarshal(envelope["predicate"], &predicate) != nil {
-		issues = append(issues, "PROVENANCE_PREDICATE_INCOMPLETE")
+	if json.Unmarshal(data, &envelope) != nil || json.Unmarshal(envelope["predicate"], &predicate) != nil || predicate == nil {
+		return nil, append(issues, "PROVENANCE_PREDICATE_INCOMPLETE")
 	}
 	return p, issues
 }

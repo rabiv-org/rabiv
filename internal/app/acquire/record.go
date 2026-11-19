@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"strings"
 	"time"
 
 	v1 "github.com/rabiv-org/rabiv/contracts/v1"
@@ -18,6 +19,16 @@ import (
 
 // Version versions only intermediate acquisition records, not contracts/v1.
 const Version = "acquisition/v1"
+
+// ParseReference accepts an explicit id@sha256hex CLI reference, never a path/URL.
+func ParseReference(raw string) (artifact.ObjectReference, error) {
+	id, hash, ok := strings.Cut(raw, "@")
+	r := artifact.ObjectReference{ID: id, Digest: artifact.Digest{Algorithm: "sha256", Value: hash}}
+	if !ok || r.Validate() != nil {
+		return artifact.ObjectReference{}, errors.New("invalid explicit object reference")
+	}
+	return r, nil
+}
 
 // InputError carries only a sanitized acquisition outcome across adapter ports.
 type InputError struct{ Code v1.FailureCode }

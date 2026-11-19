@@ -103,3 +103,27 @@ func TestAmbiguityUnknownAndLabelMismatch(t *testing.T) {
 		t.Fatal("accepted conflicting source labels")
 	}
 }
+
+func TestEpochLabelEnrichmentAndContradiction(t *testing.T) {
+	c := fixtureCapture()
+	s := c.Window.From
+	id := strings.Repeat("e", 64)
+	full := observation(id, "12", s, time.Time{})
+	partial := full
+	partial.RawRole = ""
+	partial.PipelineID = ""
+	partial.CommitSHA = ""
+	c.Containers = []Container{partial, full}
+	c.Events = []Event{{Kind: ProcessExec, At: s.Add(time.Second), Source: "TETRAGON", ContainerID: id[:11], ExecID: "parent"}, {Kind: ProcessExec, At: s.Add(2 * time.Second), Source: "TETRAGON", ContainerID: id[:11], ExecID: "child", ParentExecID: "parent"}}
+	r, e := Resolve(c, []build.Context{target("12")})
+	if e != nil || len(r.Scopes) != 1 || !r.Events[1].ParentObserved {
+		t.Fatalf("metadata enrichment/process link: %+v %v", r, e)
+	}
+	conflicting := full
+	conflicting.CommitSHA = strings.Repeat("f", 40)
+	c.Containers = append(c.Containers, conflicting)
+	r, e = Resolve(c, []build.Context{target("12")})
+	if e != nil || len(r.Scopes) != 0 || r.Events[0].Resolution == "MATCHED" {
+		t.Fatal("contradictory epoch retained as matched")
+	}
+}

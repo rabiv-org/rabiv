@@ -28,3 +28,12 @@ func TestRunnerInvalidDependencyPreserved(t *testing.T) {
 		}
 	}
 }
+
+func TestNullPredicateRemainsAnInvalidRawClaim(t *testing.T) {
+	raw := fmt.Sprintf(`{"_type":"https://in-toto.io/Statement/v1","predicateType":"https://slsa.dev/provenance/v1","subject":[{"name":"artifact","digest":{"sha256":%q}}],"predicate":null}`, strings.Repeat("a", 64))
+	r := artifact.ObjectReference{ID: "raw", Digest: acquire.Hash([]byte(raw))}
+	claim, issues := (Parser{}).Parse([]byte(raw), r)
+	if claim != nil || !slices.Contains(issues, "PROVENANCE_PREDICATE_INCOMPLETE") {
+		t.Fatal("null predicate presented as a supported projection")
+	}
+}

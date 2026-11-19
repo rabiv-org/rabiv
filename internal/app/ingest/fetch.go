@@ -37,7 +37,7 @@ type fetched struct {
 
 func prepare(ctx context.Context, ci CI, id string, job build.Identity, at time.Time, maxArchive int64) (fetched, error) {
 	var f fetched
-	if artifact.ValidateID(id+".metadata") != nil || artifact.ValidateID(id+".archive") != nil || job.Validate() != nil || build.ValidateTime(at) != nil || maxArchive <= 0 {
+	if artifact.ValidateID(id) != nil || artifact.ValidateID(id+".metadata") != nil || artifact.ValidateID(id+".archive") != nil || job.Validate() != nil || build.ValidateTime(at) != nil || maxArchive <= 0 {
 		return f, errors.New("invalid fetch request")
 	}
 	f.record = acquire.Job{Version: acquire.Version, Build: build.Context{Identity: job}, ArtifactsRequested: true, RecordedAt: at}

@@ -22,8 +22,9 @@ type SubjectBytes struct {
 	Bytes []byte
 }
 type Contents struct {
-	Subjects                 []SubjectBytes
-	Provenance, ExistingSBOM []byte
+	Subjects                       []SubjectBytes
+	Provenance, ExistingSBOM       []byte
+	ProvenancePresent, SBOMPresent bool
 }
 type ArchiveReader interface {
 	Read(context.Context, []byte, []string) (Contents, error)
@@ -168,7 +169,7 @@ func Process(ctx context.Context, fetch acquire.Source, out acquire.Sink, archiv
 	put := func(data []byte, limit int64) (artifact.ObjectReference, error) {
 		return out.Put(ctx, "sha256-"+acquire.Hash(data).Value, bytes.NewReader(data), limit)
 	}
-	if len(contents.Provenance) > 0 {
+	if contents.ProvenancePresent {
 		ref, e := put(contents.Provenance, 1<<20)
 		if e != nil {
 			return zero, e
@@ -178,7 +179,7 @@ func Process(ctx context.Context, fetch acquire.Source, out acquire.Sink, archiv
 	} else {
 		r.Issues = append(r.Issues, "PROVENANCE_MISSING")
 	}
-	if len(contents.ExistingSBOM) > 0 {
+	if contents.SBOMPresent {
 		ref, e := put(contents.ExistingSBOM, maxSBOM)
 		if e != nil {
 			return zero, e

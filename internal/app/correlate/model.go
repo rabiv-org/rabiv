@@ -37,12 +37,15 @@ const (
 	FileWriteIntent EventKind = "FILE_WRITE_INTENT"
 	TCPConnect      EventKind = "TCP_CONNECT"
 	Unsupported     EventKind = "UNSUPPORTED"
+	SourceLoss      EventKind = "SOURCE_LOSS"
 )
 
 // Event excludes process arguments, environment, credentials and payload bytes.
 // ExecID is the source's process identity; PID alone is never a correlation key.
 type Event struct {
 	Kind               EventKind `json:"kind"`
+	NativeKind         string    `json:"native_kind,omitempty"`
+	LossCount          *uint64   `json:"loss_count,omitempty"`
 	At                 time.Time `json:"at"`
 	Source             string    `json:"source"`
 	ContainerID        string    `json:"container_id,omitempty"`
@@ -110,9 +113,12 @@ func (c Capture) Validate() error {
 			return errors.New("invalid observed container ID")
 		}
 		switch v.Kind {
-		case ProcessExec, ProcessExit, FileWriteIntent, TCPConnect, Unsupported:
+		case ProcessExec, ProcessExit, FileWriteIntent, TCPConnect, Unsupported, SourceLoss:
 		default:
 			return errors.New("unsupported normalized event kind")
+		}
+		if v.Kind == SourceLoss && v.LossCount == nil || v.Kind != SourceLoss && v.LossCount != nil {
+			return errors.New("invalid source loss report")
 		}
 	}
 	for _, g := range c.Gaps {
