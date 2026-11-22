@@ -142,3 +142,20 @@ func TestConcurrentJobGapsStayConservative(t *testing.T) {
 		t.Fatal("observations from job A hid missing observations for job B")
 	}
 }
+
+func TestInterruptedCaptureCanBeStoredAndProducesFailedManifest(t *testing.T) {
+	d := &lifecycle{done: make(chan struct{})}
+	runtime := &runtimeStream{events: []message[correlate.Event]{{value: correlate.Event{Kind: correlate.ProcessExec, At: time.Now().UTC(), Source: "TETRAGON", ExecID: "observed"}}}}
+	c, captureErr := Capture(context.Background(), CaptureConfig{ID: "capture", HostID: "host", BootID: "boot", Duration: time.Second, InventoryInterval: time.Second, MaxBytes: 1 << 20, MaxRecords: 10}, errorDocker{stream: d}, runtime)
+	if captureErr == nil || !c.Interrupted || c.Validate() != nil || len(c.Events) != 1 {
+		t.Fatal("capture error lost its usable interrupted snapshot")
+	}
+	_, jobs := evidenceFixture()
+	m, objects, _ := produceFixture(t, c, jobs, 0)
+	if m.State != v1.Failed || m.Failure == nil || m.Failure.Code != v1.InputUnavailable || m.Payload == nil {
+		t.Fatal("persisted partial capture presented as finalized evidence")
+	}
+	if _, err := objects.Get(context.Background(), m.Payload.Reference, 1<<20); err != nil {
+		t.Fatal("acknowledged evidence bytes unavailable")
+	}
+}

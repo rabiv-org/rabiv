@@ -69,13 +69,16 @@ func TestMalformedStreamsConsumeRecordBudget(t *testing.T) {
 				r.remaining = 100
 			}
 			c, err := Capture(context.Background(), CaptureConfig{ID: "capture", HostID: "host", BootID: "boot", Duration: 80 * time.Millisecond, InventoryInterval: time.Second, MaxBytes: 1 << 20, MaxRecords: limit}, errorDocker{stream: d}, r)
-			var recordErrors uint64
+			var recordErrors, limitHits uint64
 			for _, diag := range c.Diagnostics {
+				if diag.Code == "CAPTURE_LIMIT" {
+					limitHits += diag.Count
+				}
 				if diag.Code != "CAPTURE_LIMIT" && diag.Code != "NO_TELEMETRY_WITNESS" {
 					recordErrors += diag.Count
 				}
 			}
-			if recordErrors > limit || c.Dropped == 0 || err == nil || !c.Interrupted {
+			if recordErrors > limit || limitHits == 0 || err == nil || !c.Interrupted {
 				t.Fatalf("errors=%d limit=%d dropped=%d interrupted=%v err=%v", recordErrors, limit, c.Dropped, c.Interrupted, err)
 			}
 			if source == "tetragon" && len(c.Events) != 1 {
@@ -92,6 +95,15 @@ func TestMalformedStreamsConsumeRecordBudget(t *testing.T) {
 				t.Fatal("runtime stream not closed")
 			}
 		})
+	}
+}
+
+func TestFailedReadsDoNotInventDroppedRecords(t *testing.T) {
+	d := &lifecycle{done: make(chan struct{})}
+	r := &failingRuntime{lifecycle: lifecycle{done: make(chan struct{})}, remaining: 100}
+	c, err := Capture(context.Background(), CaptureConfig{ID: "capture", HostID: "host", BootID: "boot", Duration: time.Second, InventoryInterval: time.Second, MaxBytes: 1 << 20, MaxRecords: 4}, errorDocker{stream: d}, r)
+	if err == nil || !c.Interrupted || c.Dropped != 0 {
+		t.Fatalf("failed reads established no dropped event count: dropped=%d interrupted=%v err=%v", c.Dropped, c.Interrupted, err)
 	}
 }
 
@@ -112,5 +124,20 @@ func TestCancelledPumpDoesNotReadAgain(t *testing.T) {
 	wg.Wait()
 	if _, ok := <-ch; ok {
 		t.Fatal("record emitted after cancellation")
+	}
+}
+
+func TestCancellationWithReadyEOFRemainsInterrupted(t *testing.T) {
+	// EOF can already be buffered when Ready cancels the parent. Exercise the
+	// select race: choosing EOF must not turn cancelled capture into success.
+	for attempt := 0; attempt < 32; attempt++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		d := &lifecycle{done: make(chan struct{})}
+		r := &runtimeStream{events: []message[correlate.Event]{{value: correlate.Event{Kind: correlate.ProcessExec, At: time.Now().UTC(), Source: "TETRAGON", ExecID: "witness"}}}}
+		c, err := Capture(ctx, CaptureConfig{ID: "capture", HostID: "host", BootID: "boot", Duration: time.Second, InventoryInterval: time.Second, MaxBytes: 1 << 20, MaxRecords: 10, Ready: cancel}, errorDocker{stream: d}, r)
+		cancel()
+		if !errors.Is(err, context.Canceled) || !c.Interrupted || !slices.Contains(c.Gaps, evidence.Gap{Code: evidence.ObservationInterrupted}) {
+			t.Fatalf("cancelled EOF became success at attempt %d: interrupted=%v err=%v", attempt, c.Interrupted, err)
+		}
 	}
 }

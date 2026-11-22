@@ -105,11 +105,13 @@ func Capture(parent context.Context, c CaptureConfig, docker Docker, runtime Run
 	used := int64(4096)
 	records := 0
 	ready := false
-	add := func(v any) bool {
+	add := func(v any, recordReceived bool) bool {
 		b, e := json.Marshal(v)
 		if e != nil || used+int64(len(b))+1 > c.MaxBytes || records >= c.MaxRecords {
 			r.Interrupted = true
-			r.Dropped++
+			if recordReceived {
+				r.Dropped++
+			}
 			gaps[evidence.ObservationInterrupted] = true
 			counts["CAPTURE_LIMIT"]++
 			return false
@@ -141,14 +143,14 @@ loop:
 			if m.err != nil {
 				// Charge failed reads to the same record/byte work budget. The
 				// port error alone does not establish JSON truncation or loss count.
-				if !add(correlate.Diagnostic{Code: "DOCKER_RECORD_ERROR", Count: 1}) {
+				if !add(correlate.Diagnostic{Code: "DOCKER_RECORD_ERROR", Count: 1}, false) {
 					break loop
 				}
 				gaps[evidence.ObservationInterrupted] = true
 				counts["DOCKER_RECORD_ERROR"]++
 				continue
 			}
-			if !add(m.value) {
+			if !add(m.value, true) {
 				break loop
 			}
 			r.Containers = append(r.Containers, m.value)
@@ -158,7 +160,7 @@ loop:
 					gaps[evidence.ScopeMetadataUnavailable] = true
 					counts["INSPECT_UNAVAILABLE"]++
 				} else {
-					if !add(o) {
+					if !add(o, true) {
 						break loop
 					}
 					r.Containers = append(r.Containers, o)
@@ -174,14 +176,14 @@ loop:
 				break loop
 			}
 			if m.err != nil {
-				if !add(correlate.Diagnostic{Code: "TETRAGON_RECORD_ERROR", Count: 1}) {
+				if !add(correlate.Diagnostic{Code: "TETRAGON_RECORD_ERROR", Count: 1}, false) {
 					break loop
 				}
 				gaps[evidence.ObservationInterrupted] = true
 				counts["TETRAGON_RECORD_ERROR"]++
 				continue
 			}
-			if !add(m.value) {
+			if !add(m.value, true) {
 				break loop
 			}
 			r.Events = append(r.Events, m.value)
@@ -198,7 +200,7 @@ loop:
 				counts["INVENTORY_UNAVAILABLE"]++
 			} else {
 				for _, o := range m.value {
-					if !add(o) {
+					if !add(o, true) {
 						break loop
 					}
 					r.Containers = append(r.Containers, o)
@@ -212,6 +214,13 @@ loop:
 		}
 	}
 	r.Window.Until = time.Now().UTC()
+	// EOF/closed channels may win select concurrently with parent cancellation.
+	// The chosen receive cannot turn a cancelled observation window into success.
+	if err := parent.Err(); err != nil {
+		r.Interrupted = true
+		gaps[evidence.ObservationInterrupted] = true
+		terminal = err
+	}
 	if !ready {
 		gaps[evidence.ObservationInterrupted] = true
 		counts["NO_TELEMETRY_WITNESS"]++
