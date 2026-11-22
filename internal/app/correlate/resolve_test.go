@@ -127,3 +127,49 @@ func TestEpochLabelEnrichmentAndContradiction(t *testing.T) {
 		t.Fatal("contradictory epoch retained as matched")
 	}
 }
+
+func TestObservedExecWithUnresolvedScopeDoesNotClaimMissingExec(t *testing.T) {
+	c := fixtureCapture()
+	c.Events = []Event{{Kind: ProcessExec, At: c.Window.From, Source: "TETRAGON", ExecID: "observed-exec"}}
+	r, err := Resolve(c, []build.Context{target("12")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Events[0].Resolution != "NO_CONTAINER_ID" || r.Events[0].ProcessObserved {
+		t.Fatal("unresolved scope was silently repaired")
+	}
+	for _, d := range r.Diagnostics {
+		if d.Code == "PROCESS_EXEC_UNOBSERVED_OR_AMBIGUOUS" {
+			t.Fatalf("known exec incorrectly classified: %+v", d)
+		}
+	}
+	if len(r.Diagnostics) == 0 {
+		t.Fatal("unresolved correlation diagnostic lost")
+	}
+}
+
+func TestMissingProcessAndParentMetadataRemainExplicit(t *testing.T) {
+	c := fixtureCapture()
+	id := strings.Repeat("b", 64)
+	c.Containers = []Container{observation(id, "12", c.Window.From, c.Window.Until)}
+	c.Events = []Event{
+		{Kind: ProcessExec, At: c.Window.From.Add(time.Second), Source: "TETRAGON", ContainerID: id[:9], ExecID: "child", ParentExecID: "unobserved-parent"},
+		{Kind: ProcessExit, At: c.Window.From.Add(2 * time.Second), Source: "TETRAGON", ContainerID: id[:9], ExecID: "unobserved-exec"},
+	}
+	r, err := Resolve(c, []build.Context{target("12")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.Events[0].ProcessObserved || r.Events[0].ParentObserved || r.Events[1].ProcessObserved {
+		t.Fatal("missing parent or exec observation fabricated")
+	}
+	var absent uint64
+	for _, d := range r.Diagnostics {
+		if d.Code == "PROCESS_EXEC_UNOBSERVED_OR_AMBIGUOUS" {
+			absent += d.Count
+		}
+	}
+	if absent != 1 {
+		t.Fatalf("missing parent was conflated with missing child exec: count=%d", absent)
+	}
+}

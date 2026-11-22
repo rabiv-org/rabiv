@@ -253,7 +253,11 @@ func Resolve(c Capture, targets []build.Context) (Result, error) {
 			a.ProcessObserved = true
 		} else {
 			gaps[evidence.ScopeMetadataUnavailable] = true
-			counts["PROCESS_EXEC_UNOBSERVED_OR_AMBIGUOUS"]++
+			if !ok || conflicts[a.Event.ExecID] {
+				counts["PROCESS_EXEC_UNOBSERVED_OR_AMBIGUOUS"]++
+			} else {
+				counts["PROCESS_BINDING_UNRESOLVED"]++
+			}
 		}
 		if p, ok := processes[a.Event.ParentExecID]; a.Event.ParentExecID != "" && ok && !conflicts[a.Event.ParentExecID] && !a.Event.At.Before(r.Events[p].Event.At) {
 			a.ParentObserved = true
