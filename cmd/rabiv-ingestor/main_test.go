@@ -9,13 +9,125 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"syscall"
 	"testing"
+	"time"
 
+	input "github.com/rabiv-org/rabiv/internal/adapters/storage/input"
+	"github.com/rabiv-org/rabiv/internal/adapters/worker"
 	"github.com/rabiv-org/rabiv/internal/app/acquire"
 	"github.com/rabiv-org/rabiv/internal/app/ingest"
 	"github.com/rabiv-org/rabiv/internal/domain/artifact"
 )
+
+func TestFetchChannelsRequireSeparateReadersAndOneWriter(t *testing.T) {
+	base := [3]input.Config{
+		{WriterUID: 100, WriterGID: 101, ReaderUID: 200, ReaderGID: 300},
+		{WriterUID: 100, WriterGID: 101, ReaderUID: 201, ReaderGID: 301},
+		{WriterUID: 100, WriterGID: 101, ReaderUID: 202, ReaderGID: 302},
+	}
+	if err := checkFetchChannels(base[0], base[1], base[2]); err != nil {
+		t.Fatal(err)
+	}
+	for _, pair := range [][2]int{{0, 1}, {0, 2}, {1, 2}} {
+		for _, field := range []string{"reader_uid", "reader_gid"} {
+			t.Run(fmt.Sprint(pair, field), func(t *testing.T) {
+				c := base
+				if field == "reader_uid" {
+					c[pair[1]].ReaderUID = c[pair[0]].ReaderUID
+				} else {
+					c[pair[1]].ReaderGID = c[pair[0]].ReaderGID
+				}
+				if checkFetchChannels(c[0], c[1], c[2]) == nil {
+					t.Fatal("shared reader authority accepted")
+				}
+			})
+		}
+	}
+	for _, index := range []int{1, 2} {
+		for _, field := range []string{"writer_uid", "writer_gid"} {
+			c := base
+			if field == "writer_uid" {
+				c[index].WriterUID++
+			} else {
+				c[index].WriterGID++
+			}
+			if checkFetchChannels(c[0], c[1], c[2]) == nil {
+				t.Fatal("different Fetch writer accepted")
+			}
+		}
+	}
+}
+
+func TestWorkerChannelsRemainBoundToProfile(t *testing.T) {
+	p := worker.Config{FetchRoot: "/lab/fetch", ResultRoot: "/lab/result", FetchReaderGID: 300, ResultReaderGID: 301}
+	fetch := input.Config{RootDir: p.FetchRoot, ReaderGID: p.FetchReaderGID}
+	result := input.Config{RootDir: p.ResultRoot, ReaderGID: p.ResultReaderGID}
+	if err := checkWorkerChannels(p, fetch, result); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"fetch_root", "result_root", "fetch_gid", "result_gid"} {
+		t.Run(field, func(t *testing.T) {
+			f, r := fetch, result
+			switch field {
+			case "fetch_root":
+				f.RootDir += "/other"
+			case "result_root":
+				r.RootDir += "/other"
+			case "fetch_gid":
+				f.ReaderGID++
+			case "result_gid":
+				r.ReaderGID++
+			}
+			if checkWorkerChannels(p, f, r) == nil {
+				t.Fatal("worker channel/profile substitution accepted")
+			}
+		})
+	}
+}
+
+func TestAcquisitionOptionsPreserveExactSubjectsAndLimits(t *testing.T) {
+	names := []string{"dist/中 app.bin", "e\u0301.bin", "é.bin"}
+	var args []string
+	for _, name := range names {
+		args = append(args, "--subject", name)
+	}
+	w, err := parseWorker(args)
+	if err != nil || !slices.Equal(w.subjects, names) || w.archive.Limits.Archive != 32<<20 || w.archive.Limits.Entry != 16<<20 || w.archive.Limits.Expanded != 48<<20 || w.archive.Limits.Entries != 1024 || w.archive.Limits.Ratio != 100 || w.maxSBOM != 8<<20 || w.archive.ProvenanceEntry != "artifacts-metadata.json" {
+		t.Fatalf("worker selection or defaults changed: %+v %v", w, err)
+	}
+	f, err := parseFinalize(args)
+	if err != nil || !slices.Equal(f.subjects, names) || f.workerRef != "" || f.maxArchive != 32<<20 || f.maxSBOM != 8<<20 {
+		t.Fatalf("finalizer selection or missing-worker semantics changed: %+v %v", f, err)
+	}
+	custom, err := parseWorker(append(args, "--max-archive", "4096", "--max-entry", "1024", "--max-expanded", "8192", "--max-entries", "3", "--max-ratio", "5", "--max-sbom", "2048"))
+	if err != nil || custom.archive.Limits.Archive != 4096 || custom.archive.Limits.Entry != 1024 || custom.archive.Limits.Expanded != 8192 || custom.archive.Limits.Entries != 3 || custom.archive.Limits.Ratio != 5 || custom.maxSBOM != 2048 {
+		t.Fatal("explicit worker limits changed")
+	}
+}
+
+func TestFetchOptionsKeepExplicitCredentialModes(t *testing.T) {
+	for _, tc := range []struct {
+		args  []string
+		valid bool
+	}{
+		{nil, false},
+		{[]string{"--public"}, true},
+		{[]string{"--credential-fd", "3"}, true},
+		{[]string{"--credential-fd", "2"}, false},
+		{[]string{"--public", "--credential-fd", "3"}, false},
+		{[]string{"--public", "--token", "synthetic-only"}, false},
+	} {
+		o, err := parseFetch(tc.args)
+		if (err == nil) != tc.valid {
+			t.Fatalf("credential mode changed: args=%v err=%v", tc.args, err)
+		}
+		if err == nil && (o.timeout != 2*time.Minute || o.maxArchive != 32<<20) {
+			t.Fatal("Fetch bounds changed")
+		}
+	}
+}
 
 func TestFetchRejectsSetupBeforeReadingCredential(t *testing.T) {
 	r, w, err := os.Pipe()
