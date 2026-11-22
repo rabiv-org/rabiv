@@ -73,7 +73,9 @@ root-owned profile and binaries. It calls no sudo and creates no accounts/servic
 The unit has a distinct UID, exact supplementary groups, no_new_privs, empty
 capabilities, private network/mounts/devices/tmp, AF_UNIX-only sockets, protected
 system/home/kernel/cgroups, read-only Fetch and private writable work/result paths.
-Credentials, decision storage and /run control sockets are inaccessible. Memory,
+Credentials and decision storage are inaccessible. A private read-only tmpfs
+masks host `/run` and its Ubuntu alias `/var/run`, including control sockets.
+This lets systemd prepare the mount namespace before the Worker starts. Memory,
 CPU, tasks and runtime are bounded. No resource or namespace property is considered
 verified merely because its property string is present.
 

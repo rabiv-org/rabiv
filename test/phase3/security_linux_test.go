@@ -86,6 +86,10 @@ func init() {
 		ok["decision_writes_denied"] = denied(filepath.Join(p.DecisionRoot, "forged"), os.O_WRONLY|os.O_CREATE)
 		ok["private_tmp_readonly"] = denied("/tmp/rabiv-worker-probe", os.O_WRONLY|os.O_CREATE)
 		ok["outside_workspace_readonly"] = denied("/etc/rabiv-worker-probe", os.O_WRONLY|os.O_CREATE)
+		_, e = os.Lstat("/run/systemd/private")
+		ok["host_run_socket_hidden"] = errors.Is(e, os.ErrNotExist)
+		_, e = os.Lstat("/var/run/systemd/private")
+		ok["host_var_run_alias_hidden"] = errors.Is(e, os.ErrNotExist)
 		fd, e := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
 		if e == nil {
 			_ = syscall.Close(fd)
@@ -119,7 +123,7 @@ func init() {
 				}
 			}
 		}
-		for _, key := range []string{"fetch_readonly", "credentials_inaccessible", "decision_writes_denied", "private_tmp_readonly", "outside_workspace_readonly", "inet_socket_denied", "workspace_write_allowed", "memory.max", "pids.max", "cpu.max"} {
+		for _, key := range []string{"fetch_readonly", "credentials_inaccessible", "decision_writes_denied", "private_tmp_readonly", "outside_workspace_readonly", "host_run_socket_hidden", "host_var_run_alias_hidden", "inet_socket_denied", "workspace_write_allowed", "memory.max", "pids.max", "cpu.max"} {
 			if !ok[key] {
 				_, _ = fmt.Fprintln(os.Stderr, "VM worker assertion failed:", key)
 				os.Exit(1)
@@ -226,6 +230,17 @@ func TestVMPhase3(t *testing.T) {
 	if os.Getuid() != 0 || !vmEnvironment() {
 		t.Fatal("root on dedicated Ubuntu/KVM required")
 	}
+	for _, path := range []string{"/run/systemd/private", "/var/run/systemd/private"} {
+		info, err := os.Lstat(path)
+		if err != nil || info.Mode()&os.ModeSocket == 0 {
+			t.Fatal("host systemd socket is required for the namespace visibility check")
+		}
+	}
+	// Provisioning modes must not depend on the invoking sudo shell's umask.
+	// This changes only this isolated test process; 0700 staging/workspaces stay
+	// private and runtime adapters still refuse to repair administrator layouts.
+	oldMask := syscall.Umask(0022)
+	defer syscall.Umask(oldMask)
 	for _, tool := range []string{"useradd", "userdel", "groupadd", "groupdel", "setpriv", "getfacl", "findmnt", "systemd-run", "systemctl", "getent", "pkill"} {
 		if _, e := exec.LookPath(tool); e != nil {
 			t.Fatal("missing tool", tool)

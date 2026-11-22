@@ -59,7 +59,7 @@ func (c Config) Validate() error {
 	}
 	paths := []string{c.FetchRoot, c.ResultRoot, c.Workspace, c.Executable, c.SyftBinary}
 	for _, p := range paths {
-		if !canonical(p) || within(p, "/home") || within(p, "/root") || within(p, "/tmp") || within(p, "/var/tmp") || within(p, "/run") {
+		if !canonical(p) || within(p, "/home") || within(p, "/root") || within(p, "/tmp") || within(p, "/var/tmp") || within(p, "/run") || within(p, "/var/run") {
 			return ErrIsolation
 		}
 	}
@@ -138,15 +138,29 @@ func (c Config) Arguments(profile, unit string, args []string) ([]string, error)
 			return nil, ErrIsolation
 		}
 	}
+	var inaccessible []string
+	for _, path := range append([]string{c.DecisionRoot}, c.CredentialPaths...) {
+		if within(path, "/run") || within(path, "/var/run") {
+			// /var/run aliases /run on the supported Ubuntu deployment. A path
+			// below the overlay is already hidden and need not exist in the unit.
+			continue
+		}
+		inaccessible = append(inaccessible, path)
+	}
 	props := []string{
 		fmt.Sprintf("User=%d", c.UID), fmt.Sprintf("Group=%d", c.GID), fmt.Sprintf("SupplementaryGroups=%d %d", c.FetchReaderGID, c.ResultReaderGID),
 		"NoNewPrivileges=yes", "CapabilityBoundingSet=", "AmbientCapabilities=", "PrivateNetwork=yes", "RestrictAddressFamilies=AF_UNIX", "IPAddressDeny=any",
 		"ProtectSystem=strict", "ProtectHome=yes", "PrivateTmp=yes", "PrivateDevices=yes", "PrivateMounts=yes", "ProtectKernelTunables=yes", "ProtectKernelModules=yes", "ProtectKernelLogs=yes", "ProtectControlGroups=yes", "ProtectClock=yes", "ProtectHostname=yes",
 		"RestrictNamespaces=yes", "RestrictRealtime=yes", "RestrictSUIDSGID=yes", "LockPersonality=yes", "MemoryDenyWriteExecute=yes", "ProtectProc=invisible", "ProcSubset=pid", "SystemCallArchitectures=native", "UMask=0077",
 		"ReadOnlyPaths=" + c.FetchRoot + " /tmp /var/tmp", "ReadWritePaths=" + c.Workspace + " " + c.ResultRoot,
-		"InaccessiblePaths=" + c.DecisionRoot + " " + strings.Join(c.CredentialPaths, " ") + " -/run -/var/run",
+		// systemd v255 needs /run during namespace setup. Mask the host's
+		// contents with a private mount instead of marking /run inaccessible.
+		"TemporaryFileSystem=/run:ro,nosuid,nodev,noexec,mode=0755",
 		fmt.Sprintf("MemoryMax=%d", c.MemoryBytes), "MemorySwapMax=0", fmt.Sprintf("CPUQuota=%d%%", c.CPUPercent), fmt.Sprintf("TasksMax=%d", c.Tasks), fmt.Sprintf("RuntimeMaxSec=%d", c.TimeoutSeconds), "TimeoutStopSec=5s", "KillMode=control-group",
 		"Description=" + unit,
+	}
+	if len(inaccessible) > 0 {
+		props = append(props, "InaccessiblePaths="+strings.Join(inaccessible, " "))
 	}
 	out := []string{"--quiet", "--wait", "--collect", "--pipe", "--service-type=exec", "--unit=" + unit}
 	for _, p := range props {
@@ -231,6 +245,17 @@ func (c Config) Check() error {
 	}
 	var stat syscall.Statfs_t
 	if syscall.Statfs(c.FetchRoot, &stat) != nil || stat.Flags&syscall.MS_RDONLY == 0 {
+		return ErrIsolation
+	}
+	if syscall.Statfs("/run", &stat) != nil || stat.Flags&syscall.MS_RDONLY == 0 {
+		return ErrIsolation
+	}
+	runtimeDir, err := os.Stat("/run")
+	runtimeAlias, aliasErr := os.Stat("/var/run")
+	if err != nil || aliasErr != nil || !os.SameFile(runtimeDir, runtimeAlias) {
+		return ErrIsolation
+	}
+	if _, err := os.Lstat("/run/systemd/private"); !errors.Is(err, os.ErrNotExist) {
 		return ErrIsolation
 	}
 	for _, p := range append([]string{c.DecisionRoot}, c.CredentialPaths...) {
