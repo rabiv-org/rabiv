@@ -81,6 +81,24 @@ func credential(fd int) ([]byte, error) {
 	return b[:len(token)], nil
 }
 
+// writeFetchResult acknowledges only committed job snapshots. A non-nil fetch
+// error with references is partial delivery and remains a nonzero CLI outcome.
+// If no snapshot was committed, stdout carries no acknowledgement.
+func writeFetchResult(out io.Writer, refs ingest.FetchRefs, fetchErr error) error {
+	if refs == (ingest.FetchRefs{}) {
+		if fetchErr == nil {
+			return errors.New("fetch returned no committed snapshot references")
+		}
+		return fetchErr
+	}
+	for _, ref := range []artifact.ObjectReference{refs.Collector, refs.Worker, refs.Finalizer} {
+		if ref != (artifact.ObjectReference{}) && ref.Validate() != nil {
+			return errors.Join(fetchErr, errors.New("invalid fetch acknowledgement reference"))
+		}
+	}
+	return errors.Join(fetchErr, json.NewEncoder(out).Encode(refs))
+}
+
 func run(ctx context.Context, args []string, out io.Writer) error {
 	if len(args) == 0 {
 		return errors.New("usage: rabiv-ingestor fetch|worker-run|worker|finalize")
@@ -185,11 +203,7 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 		}
 		defer client.Close()
 		refs, e := ingest.FetchTo(ctx, client, ingest.FetchChannels{Collector: collect, Worker: work, Finalizer: final}, *id, build.Identity{Provider: build.GitLab, Instance: *instance, ProjectID: *project, JobID: *job}, time.Now().UTC(), *max)
-		// On partial channel publication return the already committed references too.
-		if encodeErr := json.NewEncoder(out).Encode(refs); encodeErr != nil {
-			return encodeErr
-		}
-		return e
+		return writeFetchResult(out, refs, e)
 	case "worker":
 		profilePath := f.String("profile", "", "root-owned isolation profile")
 		fetchCfg := f.String("fetch-channel", "", "Worker's Fetch channel")

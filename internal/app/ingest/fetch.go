@@ -25,9 +25,9 @@ type CI interface {
 // returned individually on partial failure, without claiming all-channel success.
 type FetchChannels struct{ Collector, Worker, Finalizer acquire.Sink }
 type FetchRefs struct {
-	Collector artifact.ObjectReference `json:"collector"`
-	Worker    artifact.ObjectReference `json:"worker"`
-	Finalizer artifact.ObjectReference `json:"finalizer"`
+	Collector artifact.ObjectReference `json:"collector,omitzero"`
+	Worker    artifact.ObjectReference `json:"worker,omitzero"`
+	Finalizer artifact.ObjectReference `json:"finalizer,omitzero"`
 }
 
 type fetched struct {

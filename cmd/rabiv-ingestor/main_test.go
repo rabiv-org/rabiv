@@ -3,9 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"syscall"
 	"testing"
+
+	"github.com/rabiv-org/rabiv/internal/app/acquire"
+	"github.com/rabiv-org/rabiv/internal/app/ingest"
+	"github.com/rabiv-org/rabiv/internal/domain/artifact"
 )
 
 func TestCommandsFailClosedWithoutSetup(t *testing.T) {
@@ -19,6 +25,60 @@ func TestCommandsFailClosedWithoutSetup(t *testing.T) {
 		}
 	}
 }
+
+func TestFetchCLIOutputAndError(t *testing.T) {
+	ref := artifact.ObjectReference{ID: "snapshot", Digest: acquire.Hash([]byte("snapshot"))}
+	storageErr := errors.New("storage failure")
+	for _, tc := range []struct {
+		name string
+		refs ingest.FetchRefs
+		err  error
+		want int
+	}{
+		{"before_any_snapshot", ingest.FetchRefs{}, storageErr, 0},
+		{"partial_collector", ingest.FetchRefs{Collector: ref}, storageErr, 1},
+		{"partial_worker", ingest.FetchRefs{Collector: ref, Worker: ref}, storageErr, 2},
+		{"complete", ingest.FetchRefs{Collector: ref, Worker: ref, Finalizer: ref}, nil, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			err := writeFetchResult(&out, tc.refs, tc.err)
+			if (err == nil) != (tc.err == nil) || tc.err != nil && !errors.Is(err, tc.err) {
+				t.Fatalf("error status changed: %v", err)
+			}
+			if tc.want == 0 {
+				if out.Len() != 0 {
+					t.Fatal("failure before commit emitted ACK")
+				}
+				return
+			}
+			var ack map[string]artifact.ObjectReference
+			if e := json.Unmarshal(out.Bytes(), &ack); e != nil {
+				t.Fatal(e)
+			}
+			if len(ack) != tc.want {
+				t.Fatalf("uncommitted references emitted: %s", out.Bytes())
+			}
+			for _, r := range ack {
+				if r.Validate() != nil {
+					t.Fatal("invalid reference emitted")
+				}
+			}
+		})
+	}
+	if err := writeFetchResult(&bytes.Buffer{}, ingest.FetchRefs{}, nil); err == nil {
+		t.Fatal("empty refs accepted as success")
+	}
+	writerErr := errors.New("stdout write failed")
+	err := writeFetchResult(failedWriter{err: writerErr}, ingest.FetchRefs{Collector: ref}, storageErr)
+	if !errors.Is(err, writerErr) || !errors.Is(err, storageErr) {
+		t.Fatal("output failure hid the acquisition failure")
+	}
+}
+
+type failedWriter struct{ err error }
+
+func (w failedWriter) Write([]byte) (int, error) { return 0, w.err }
 func TestCredentialPipeOnly(t *testing.T) {
 	r, w, e := os.Pipe()
 	if e != nil {
