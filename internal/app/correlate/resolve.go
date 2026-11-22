@@ -71,27 +71,59 @@ func Resolve(c Capture, targets []build.Context) (Result, error) {
 		}
 		identities[t.Identity] = true
 	}
-	gaps := map[evidence.GapCode]bool{}
-	counts := map[string]uint64{}
+	notes := correlationNotes{gaps: map[evidence.GapCode]bool{}, counts: map[string]uint64{}}
 	for _, g := range c.Gaps {
-		gaps[g.Code] = true
+		notes.gaps[g.Code] = true
 	}
 	for _, d := range c.Diagnostics {
-		counts[d.Code] += d.Count
+		notes.counts[d.Code] += d.Count
 	}
 	if c.Interrupted {
-		gaps[evidence.ObservationInterrupted] = true
+		notes.gaps[evidence.ObservationInterrupted] = true
 	}
-	type candidate struct {
-		scope   Scope
-		invalid bool
+	scopes, knownIDs, err := resolveScopes(c, targets, &notes)
+	if err != nil {
+		return r, err
 	}
-	candidates := map[string]*candidate{}
-	knownIDs := map[string]bool{}
+	r.Scopes = scopes
+	for _, e := range c.Events {
+		a := resolveEvent(e, scopes, knownIDs, &notes)
+		r.Events = append(r.Events, a)
+		if e.Kind != SourceLoss {
+			notes.counts[a.Resolution]++
+		}
+	}
+	linkProcesses(r.Events, &notes)
+	if len(r.Scopes) == 0 {
+		notes.gaps[evidence.UnresolvedScope] = true
+	}
+	notes.summarize(&r)
+	return r, nil
+}
+
+// correlationNotes retains capture-wide uncertainty even when some individual
+// events resolve. It deliberately does not assign gaps to particular jobs.
+type correlationNotes struct {
+	gaps   map[evidence.GapCode]bool
+	counts map[string]uint64
+}
+
+func (n *correlationNotes) summarize(r *Result) {
+	for g := range n.gaps {
+		r.Gaps = append(r.Gaps, evidence.Gap{Code: g})
+	}
+	sort.Slice(r.Gaps, func(i, j int) bool { return r.Gaps[i].Code < r.Gaps[j].Code })
+	for code, count := range n.counts {
+		r.Diagnostics = append(r.Diagnostics, Diagnostic{Code: code, Count: count})
+	}
+	sort.Slice(r.Diagnostics, func(i, j int) bool { return r.Diagnostics[i].Code < r.Diagnostics[j].Code })
+}
+
+// mergeEpochClaims enriches only the same full ID and actual start timestamp.
+// It never borrows labels from a different execution epoch.
+func mergeEpochClaims(c Capture) (map[string]Container, map[string]bool) {
 	claims := map[string]Container{}
 	blocked := map[string]bool{}
-	// Enrich only observations with the same full ID and actual start timestamp.
-	// Conflicting nonempty labels invalidate that epoch; missing labels do not.
 	for _, o := range c.Containers {
 		if o.StartedAt == nil {
 			continue
@@ -102,177 +134,206 @@ func Resolve(c Capture, targets []build.Context) (Result, error) {
 			claims[key] = o
 			continue
 		}
-		for _, pair := range [][2]*string{{&previous.JobID, &o.JobID}, {&previous.ProjectID, &o.ProjectID}, {&previous.PipelineID, &o.PipelineID}, {&previous.CommitSHA, &o.CommitSHA}, {&previous.RawRole, &o.RawRole}} {
-			if *pair[0] != "" && *pair[1] != "" && *pair[0] != *pair[1] {
-				blocked[key] = true
-			}
-			if *pair[0] == "" {
-				*pair[0] = *pair[1]
-			}
+		merged, conflict := mergeLabels(previous, o)
+		claims[key] = merged
+		if conflict {
+			blocked[key] = true
 		}
-		claims[key] = previous
 	}
+	return claims, blocked
+}
+
+func mergeLabels(previous, observed Container) (Container, bool) {
+	conflict := false
+	for _, pair := range [][2]*string{{&previous.JobID, &observed.JobID}, {&previous.ProjectID, &observed.ProjectID}, {&previous.PipelineID, &observed.PipelineID}, {&previous.CommitSHA, &observed.CommitSHA}, {&previous.RawRole, &observed.RawRole}} {
+		if *pair[0] != "" && *pair[1] != "" && *pair[0] != *pair[1] {
+			conflict = true
+		}
+		if *pair[0] == "" {
+			*pair[0] = *pair[1]
+		}
+	}
+	return previous, conflict
+}
+
+type scopeCandidate struct {
+	scope   Scope
+	invalid bool
+}
+
+func resolveScopes(c Capture, targets []build.Context, notes *correlationNotes) ([]Scope, map[string]bool, error) {
+	claims, blocked := mergeEpochClaims(c)
+	knownIDs := map[string]bool{}
+	candidates := map[string]*scopeCandidate{}
 	for _, o := range c.Containers {
 		knownIDs[o.ID] = true
 		if o.StartedAt == nil {
-			gaps[evidence.ScopeMetadataUnavailable] = true
-			counts["RUNTIME_START_UNAVAILABLE"]++
+			notes.gaps[evidence.ScopeMetadataUnavailable] = true
+			notes.counts["RUNTIME_START_UNAVAILABLE"]++
 			continue
 		}
 		key := scopeID(c, o)
 		if blocked[key] {
-			gaps[evidence.AmbiguousScope] = true
-			counts["CONTRADICTORY_SCOPE_METADATA"]++
+			notes.gaps[evidence.AmbiguousScope] = true
+			notes.counts["CONTRADICTORY_SCOPE_METADATA"]++
 			continue
 		}
 		known := claims[key]
-		o.JobID = known.JobID
-		o.ProjectID = known.ProjectID
-		o.PipelineID = known.PipelineID
-		o.CommitSHA = known.CommitSHA
-		o.RawRole = known.RawRole
-		var matches []build.Context
-		for _, t := range targets {
-			if o.JobID == t.Identity.JobID && o.ProjectID == t.Identity.ProjectID {
-				matches = append(matches, t)
-			}
-		}
-		if len(matches) != 1 {
-			if len(matches) > 1 {
-				gaps[evidence.AmbiguousScope] = true
-			} else {
-				gaps[evidence.UnresolvedScope] = true
-			}
-			counts["JOB_ASSOCIATION_UNRESOLVED"]++
+		o.JobID, o.ProjectID = known.JobID, known.ProjectID
+		o.PipelineID, o.CommitSHA, o.RawRole = known.PipelineID, known.CommitSHA, known.RawRole
+		target, ok := associateBuild(o, targets, notes)
+		if !ok {
 			continue
 		}
-		t := matches[0]
-		if o.PipelineID != "" && o.PipelineID != t.PipelineID || o.CommitSHA != "" && o.CommitSHA != t.Source.CommitSHA {
-			gaps[evidence.UnresolvedScope] = true
-			counts["BUILD_LABEL_MISMATCH"]++
-			continue
-		}
-		if o.PipelineID == "" || o.CommitSHA == "" {
-			gaps[evidence.ScopeMetadataUnavailable] = true
-			counts["BUILD_LABEL_MISSING"]++
-		}
-		id := scopeID(c, o)
-		value := Scope{Build: t.Identity, Execution: build.ExecutionScope{ScopeID: id, HostID: c.HostID, BootID: c.BootID, Container: build.ContainerIdentity{Runtime: "DOCKER", CanonicalID: o.ID}, Role: role(o.RawRole), RawRole: o.RawRole, StartedAt: *o.StartedAt, EndedAt: o.FinishedAt}}
+		value := Scope{Build: target.Identity, Execution: build.ExecutionScope{ScopeID: key, HostID: c.HostID, BootID: c.BootID, Container: build.ContainerIdentity{Runtime: "DOCKER", CanonicalID: o.ID}, Role: role(o.RawRole), RawRole: o.RawRole, StartedAt: *o.StartedAt, EndedAt: o.FinishedAt}}
 		if value.Execution.Validate() != nil {
-			return r, errors.New("invalid execution scope")
+			return nil, nil, errors.New("invalid execution scope")
 		}
-		if previous, ok := candidates[id]; ok {
-			p := &previous.scope.Execution
-			if previous.scope.Build != value.Build || p.Role != value.Execution.Role || p.RawRole != value.Execution.RawRole || p.EndedAt != nil && o.FinishedAt != nil && !p.EndedAt.Equal(*o.FinishedAt) {
-				previous.invalid = true
-				gaps[evidence.AmbiguousScope] = true
-				counts["CONTRADICTORY_SCOPE_METADATA"]++
-			} else if p.EndedAt == nil {
-				p.EndedAt = o.FinishedAt
-			}
-		} else {
-			candidates[id] = &candidate{scope: value}
+		mergeScope(candidates, value, notes)
+	}
+	scopes := []Scope{}
+	for _, candidate := range candidates {
+		if !candidate.invalid {
+			scopes = append(scopes, candidate.scope)
 		}
 	}
-	for _, v := range candidates {
-		if !v.invalid {
-			r.Scopes = append(r.Scopes, v.scope)
+	sort.Slice(scopes, func(i, j int) bool { return scopes[i].Execution.ScopeID < scopes[j].Execution.ScopeID })
+	return scopes, knownIDs, nil
+}
+
+func associateBuild(o Container, targets []build.Context, notes *correlationNotes) (build.Context, bool) {
+	var matches []build.Context
+	for _, t := range targets {
+		if o.JobID == t.Identity.JobID && o.ProjectID == t.Identity.ProjectID {
+			matches = append(matches, t)
 		}
 	}
-	sort.Slice(r.Scopes, func(i, j int) bool { return r.Scopes[i].Execution.ScopeID < r.Scopes[j].Execution.ScopeID })
+	if len(matches) != 1 {
+		gap := evidence.UnresolvedScope
+		if len(matches) > 1 {
+			gap = evidence.AmbiguousScope
+		}
+		notes.gaps[gap] = true
+		notes.counts["JOB_ASSOCIATION_UNRESOLVED"]++
+		return build.Context{}, false
+	}
+	t := matches[0]
+	if o.PipelineID != "" && o.PipelineID != t.PipelineID || o.CommitSHA != "" && o.CommitSHA != t.Source.CommitSHA {
+		notes.gaps[evidence.UnresolvedScope] = true
+		notes.counts["BUILD_LABEL_MISMATCH"]++
+		return build.Context{}, false
+	}
+	if o.PipelineID == "" || o.CommitSHA == "" {
+		notes.gaps[evidence.ScopeMetadataUnavailable] = true
+		notes.counts["BUILD_LABEL_MISSING"]++
+	}
+	return t, true
+}
+
+func mergeScope(candidates map[string]*scopeCandidate, value Scope, notes *correlationNotes) {
+	id := value.Execution.ScopeID
+	previous, ok := candidates[id]
+	if !ok {
+		candidates[id] = &scopeCandidate{scope: value}
+		return
+	}
+	p, next := &previous.scope.Execution, value.Execution
+	if previous.scope.Build != value.Build || p.Role != next.Role || p.RawRole != next.RawRole || p.EndedAt != nil && next.EndedAt != nil && !p.EndedAt.Equal(*next.EndedAt) {
+		previous.invalid = true
+		notes.gaps[evidence.AmbiguousScope] = true
+		notes.counts["CONTRADICTORY_SCOPE_METADATA"]++
+	} else if p.EndedAt == nil {
+		p.EndedAt = next.EndedAt
+	}
+}
+
+func resolveEvent(e Event, scopes []Scope, knownIDs map[string]bool, notes *correlationNotes) AttributedEvent {
+	if e.NativeKind == "process_throttle" {
+		notes.gaps[evidence.ObservationInterrupted] = true
+		notes.counts["THROTTLE_OBSERVED"]++
+	}
+	a := AttributedEvent{Event: e, Resolution: "UNRESOLVED"}
+	if e.Kind == SourceLoss {
+		a.Resolution = "SOURCE_REPORT"
+		return a
+	}
+	if e.ContainerID == "" {
+		a.Resolution = "NO_CONTAINER_ID"
+		notes.gaps[evidence.UnresolvedScope] = true
+		return a
+	}
+	fullIDs := 0
+	for id := range knownIDs {
+		if strings.HasPrefix(id, e.ContainerID) {
+			fullIDs++
+		}
+	}
+	if fullIDs > 1 {
+		a.Resolution = "AMBIGUOUS"
+		notes.gaps[evidence.AmbiguousScope] = true
+		return a
+	}
+	var matched []Scope
+	for _, s := range scopes {
+		x := s.Execution
+		if strings.HasPrefix(x.Container.CanonicalID, e.ContainerID) && !e.At.Before(x.StartedAt) && (x.EndedAt == nil || !e.At.After(*x.EndedAt)) {
+			matched = append(matched, s)
+		}
+	}
+	switch {
+	case len(matched) == 1 && fullIDs == 1:
+		a.Resolution, a.ScopeID, a.JobID = "MATCHED", matched[0].Execution.ScopeID, matched[0].Build.JobID
+	case len(matched) > 1:
+		a.Resolution = "AMBIGUOUS"
+		notes.gaps[evidence.AmbiguousScope] = true
+	default:
+		notes.gaps[evidence.UnresolvedScope] = true
+	}
+	return a
+}
+
+func linkProcesses(events []AttributedEvent, notes *correlationNotes) {
 	processes := map[string]int{}
 	conflicts := map[string]bool{}
-	for _, e := range c.Events {
-		if e.NativeKind == "process_throttle" {
-			gaps[evidence.ObservationInterrupted] = true
-			counts["THROTTLE_OBSERVED"]++
-		}
-		a := AttributedEvent{Event: e, Resolution: "UNRESOLVED"}
-		if e.Kind == SourceLoss {
-			a.Resolution = "SOURCE_REPORT"
-			r.Events = append(r.Events, a)
+	for i, a := range events {
+		if a.Event.Kind != ProcessExec || a.Event.ExecID == "" {
 			continue
 		}
-		if e.ContainerID == "" {
-			a.Resolution = "NO_CONTAINER_ID"
-			gaps[evidence.UnresolvedScope] = true
+		previous, ok := processes[a.Event.ExecID]
+		if !ok {
+			processes[a.Event.ExecID] = i
+			continue
+		}
+		p := events[previous]
+		if p.ScopeID != a.ScopeID || !p.Event.At.Equal(a.Event.At) {
+			conflicts[a.Event.ExecID] = true
+		}
+	}
+	for i := range events {
+		a := &events[i]
+		switch a.Event.Kind {
+		case SourceLoss:
+			notes.counts["SOURCE_LOSS_REPORT"]++
+		case Unsupported:
+			notes.counts["UNSUPPORTED_EVENT_KIND"]++
+		default:
+			linkProcess(a, events, processes, conflicts, notes)
+		}
+	}
+}
+
+func linkProcess(a *AttributedEvent, events []AttributedEvent, processes map[string]int, conflicts map[string]bool, notes *correlationNotes) {
+	if p, ok := processes[a.Event.ExecID]; ok && !conflicts[a.Event.ExecID] && a.Resolution == "MATCHED" && events[p].ScopeID == a.ScopeID && !a.Event.At.Before(events[p].Event.At) {
+		a.ProcessObserved = true
+	} else {
+		notes.gaps[evidence.ScopeMetadataUnavailable] = true
+		if !ok || conflicts[a.Event.ExecID] {
+			notes.counts["PROCESS_EXEC_UNOBSERVED_OR_AMBIGUOUS"]++
 		} else {
-			fullIDs := 0
-			for id := range knownIDs {
-				if strings.HasPrefix(id, e.ContainerID) {
-					fullIDs++
-				}
-			}
-			if fullIDs > 1 {
-				a.Resolution = "AMBIGUOUS"
-				gaps[evidence.AmbiguousScope] = true
-			} else {
-				var matched []Scope
-				for _, s := range r.Scopes {
-					x := s.Execution
-					if strings.HasPrefix(x.Container.CanonicalID, e.ContainerID) && !e.At.Before(x.StartedAt) && (x.EndedAt == nil || !e.At.After(*x.EndedAt)) {
-						matched = append(matched, s)
-					}
-				}
-				if len(matched) == 1 && fullIDs == 1 {
-					a.Resolution = "MATCHED"
-					a.ScopeID = matched[0].Execution.ScopeID
-					a.JobID = matched[0].Build.JobID
-				} else if len(matched) > 1 {
-					a.Resolution = "AMBIGUOUS"
-					gaps[evidence.AmbiguousScope] = true
-				} else {
-					gaps[evidence.UnresolvedScope] = true
-				}
-			}
-		}
-		r.Events = append(r.Events, a)
-		counts[a.Resolution]++
-		if e.Kind == ProcessExec && e.ExecID != "" {
-			if previous, ok := processes[e.ExecID]; ok {
-				p := r.Events[previous]
-				if p.ScopeID != a.ScopeID || !p.Event.At.Equal(e.At) {
-					conflicts[e.ExecID] = true
-				}
-			} else {
-				processes[e.ExecID] = len(r.Events) - 1
-			}
+			notes.counts["PROCESS_BINDING_UNRESOLVED"]++
 		}
 	}
-	for i := range r.Events {
-		a := &r.Events[i]
-		if a.Event.Kind == SourceLoss {
-			counts["SOURCE_LOSS_REPORT"]++
-			continue
-		}
-		if a.Event.Kind == Unsupported {
-			counts["UNSUPPORTED_EVENT_KIND"]++
-			continue
-		}
-		if p, ok := processes[a.Event.ExecID]; ok && !conflicts[a.Event.ExecID] && a.Resolution == "MATCHED" && r.Events[p].ScopeID == a.ScopeID && !a.Event.At.Before(r.Events[p].Event.At) {
-			a.ProcessObserved = true
-		} else {
-			gaps[evidence.ScopeMetadataUnavailable] = true
-			if !ok || conflicts[a.Event.ExecID] {
-				counts["PROCESS_EXEC_UNOBSERVED_OR_AMBIGUOUS"]++
-			} else {
-				counts["PROCESS_BINDING_UNRESOLVED"]++
-			}
-		}
-		if p, ok := processes[a.Event.ParentExecID]; a.Event.ParentExecID != "" && ok && !conflicts[a.Event.ParentExecID] && !a.Event.At.Before(r.Events[p].Event.At) {
-			a.ParentObserved = true
-		}
+	if p, ok := processes[a.Event.ParentExecID]; a.Event.ParentExecID != "" && ok && !conflicts[a.Event.ParentExecID] && !a.Event.At.Before(events[p].Event.At) {
+		a.ParentObserved = true
 	}
-	if len(r.Scopes) == 0 {
-		gaps[evidence.UnresolvedScope] = true
-	}
-	for g := range gaps {
-		r.Gaps = append(r.Gaps, evidence.Gap{Code: g})
-	}
-	sort.Slice(r.Gaps, func(i, j int) bool { return r.Gaps[i].Code < r.Gaps[j].Code })
-	for code, n := range counts {
-		r.Diagnostics = append(r.Diagnostics, Diagnostic{Code: code, Count: n})
-	}
-	sort.Slice(r.Diagnostics, func(i, j int) bool { return r.Diagnostics[i].Code < r.Diagnostics[j].Code })
-	return r, nil
 }
