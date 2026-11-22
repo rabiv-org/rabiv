@@ -3,12 +3,71 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	v1 "github.com/rabiv-org/rabiv/contracts/v1"
+	"github.com/rabiv-org/rabiv/internal/app/acquire"
+	"github.com/rabiv-org/rabiv/internal/domain/artifact"
+	"github.com/rabiv-org/rabiv/internal/domain/build"
 )
+
+func TestCaptureOptionsPreserveBoundsAndOptIn(t *testing.T) {
+	for _, args := range [][]string{nil, {"--owner-capture"}, {"--tetragon-fd", "3"}, {"--owner-capture", "--tetragon-fd", "2"}} {
+		if _, err := parseCapture(args); err == nil {
+			t.Fatalf("capture without complete opt-in accepted: %v", args)
+		}
+	}
+	o, err := parseCapture([]string{"--owner-capture", "--tetragon-fd", "3", "--id", "snapshot"})
+	if err != nil || o.capture.ID != "snapshot" || o.capture.Duration != 12*time.Minute || o.capture.InventoryInterval != time.Second || o.capture.MaxBytes != 64<<20 || o.capture.MaxRecords != 100000 {
+		t.Fatalf("capture defaults changed: %+v %v", o, err)
+	}
+}
+
+type targetObjects map[string][]byte
+
+func (s targetObjects) Get(_ context.Context, ref artifact.ObjectReference, limit int64) ([]byte, error) {
+	b, ok := s[ref.ID]
+	if !ok || int64(len(b)) > limit || acquire.Hash(b) != ref.Digest {
+		return nil, errors.New("missing or corrupted target snapshot")
+	}
+	return b, nil
+}
+
+func TestLoadTargetsRetainsIncompleteSelectedBuild(t *testing.T) {
+	store := targetObjects{}
+	var refs []string
+	for i, id := range []string{"complete", "selected", "other"} {
+		j := acquire.Job{Version: acquire.Version, Build: build.Context{Identity: build.Identity{Provider: build.GitLab, Instance: "https://ci.example", ProjectID: "6", JobID: fmt.Sprint(i + 1)}}, RecordedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), Failure: &v1.Failure{Code: v1.InputUnavailable}}
+		if i == 0 {
+			j.Build.PipelineID = "9"
+			j.Build.Source = &build.SourceRevision{RepositoryURI: "https://ci.example/project", CommitSHA: strings.Repeat("a", 40)}
+			j.Metadata = &artifact.ObjectReference{ID: "metadata", Digest: acquire.Hash([]byte("metadata"))}
+			j.Failure = nil
+		}
+		b, err := json.Marshal(j)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store[id] = b
+		refs = append(refs, id+"@"+acquire.Hash(b).Value)
+	}
+	jobs, selected, err := loadTargets(context.Background(), store, refs, "selected")
+	if err != nil || len(jobs) != 2 || jobs[0].ValidateComplete() != nil || jobs[1].ValidateComplete() == nil || jobs[1].Identity != selected || selected.JobID != "2" {
+		t.Fatalf("incomplete-job selection changed: %+v %+v %v", jobs, selected, err)
+	}
+	store["selected"] = []byte(`{"changed":true}`)
+	if _, _, err = loadTargets(context.Background(), store, refs, "selected"); err == nil {
+		t.Fatal("corrupted Fetch snapshot accepted")
+	}
+}
 
 func TestCaptureRejectsSetupBeforeUsingTelemetryDescriptor(t *testing.T) {
 	r, w, err := os.Pipe()
