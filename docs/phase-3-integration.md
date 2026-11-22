@@ -6,6 +6,10 @@ workflows or publish artifacts. Phase 1 contracts and Phase 2 commands/storage
 are unchanged. See [ADR 0002](decisions/0002-input-acquisition.md) for channel trust,
 identities, permissions, visibility/durability and residual risks.
 
+The command packages require Linux. The tested security deployment profile is
+Ubuntu Server 24.04 amd64, systemd/cgroups v2 and native guest ext4. Default host
+tests do not require privileged access or installed Docker, Tetragon or Syft.
+
 ## Provisioning contract
 
 An administrator provisions distinct Fetch, Capture, Collector, Worker, Finalizer
@@ -151,8 +155,8 @@ INPUT_UNAVAILABLE; a supplied valid WorkerResult carrying a producer failure als
 produces FAILED. A supplied reference whose object is missing/unreadable/corrupt,
 invalid WorkerResult JSON or wrong job/archive/subject binding returns an error
 without an ArtifactManifest ACK. These errors do not become producer failures.
-Byte objects
-are rehashed/copied into Ingestor storage before a strict ArtifactManifest ACK.
+Byte objects are rehashed/copied into Ingestor storage before a strict
+ArtifactManifest ACK.
 Failures before an ACK can leave harmless unreferenced producer objects; automatic
 orphan cleanup/recovery is deferred.
 
@@ -211,9 +215,19 @@ Subject consistency, raw-byte integrity and provenance authenticity stay distinc
 
 Standard checks: `make fmt-check`, `go test ./...`, `go vet ./...`,
 `go test -race ./...`, `make lint`, `make build`, `make vuln`, `go mod verify`,
-`go mod tidy -diff`. Default CI excludes privileged files. Tagged compilation and
-lint can run without privilege: `go test -tags=rabiv_vmtest -run '^$' ./test/phase3`.
-This explicitly runs no VM security tests.
+`go mod tidy -diff`. Default tests exclude opt-in files. CI additionally compiles
+and statically checks them without running test binaries:
+
+```bash
+go test -tags=rabiv_integration,rabiv_vmtest -exec=/usr/bin/true ./...
+go vet -tags=rabiv_integration,rabiv_vmtest ./...
+golangci-lint run --build-tags=rabiv_integration,rabiv_vmtest ./...
+```
+
+`-exec=/usr/bin/true` prevents even test-binary initializers from executing. Build
+tags must also be supplied to lint; successful compilation/vet/lint is not a VM
+or live-integration PASS. Default local integration tests use TLS/Unix fixtures;
+the tagged public GitLab test is never selected implicitly.
 
 Retained replay needs `RABIV_TEST_ARCHIVE`, `RABIV_TEST_ARCHIVE_SHA256` and JSON-array
 `RABIV_TEST_SUBJECTS` with `go test -tags=rabiv_integration ./test/phase3 -run
@@ -234,15 +248,38 @@ creates jobs, loads tracing policies or acquires credentials. Both use the
 
 ## Owner-controlled privileged verification (not automatically authorized)
 
-Build a review bundle on the host, without executing VM tests:
+Build from an exported commit so unrelated working-tree changes cannot enter the
+review bundle. On the Linux host, without executing VM tests:
 
 ```bash
-GOCACHE=/tmp/rabiv-phase3-go-cache GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
-  go build -o /tmp/rabiv-ingestor ./cmd/rabiv-ingestor
-GOCACHE=/tmp/rabiv-phase3-go-cache GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
-  go test -tags=rabiv_vmtest \
-  -c ./test/phase3 -o /tmp/acquisition.test
-bash -n test/phase3/run-vm-security.sh
+set -euo pipefail
+revision=$(git rev-parse HEAD)
+bundle=$(mktemp -d /tmp/rabiv-phase3-final.XXXXXXXX)
+mkdir "$bundle/source" "$bundle/review"
+git archive --format=tar "$revision" -o "$bundle/review/source.tar"
+tar -xf "$bundle/review/source.tar" -C "$bundle/source"
+(
+  cd "$bundle/source"
+  export GOOS=linux GOARCH=amd64 CGO_ENABLED=0
+  go build -trimpath -buildvcs=false \
+    -o "$bundle/review/rabiv-ingestor" ./cmd/rabiv-ingestor
+  go test -trimpath -buildvcs=false -tags=rabiv_vmtest \
+    -c ./test/phase3 -o "$bundle/review/acquisition.test"
+)
+cp "$bundle/source/test/phase3/run-vm-security.sh" "$bundle/review/"
+printf '%s\n' "$revision" > "$bundle/review/SOURCE_COMMIT"
+{
+  go version
+  go env GOAMD64 GOEXPERIMENT GOTOOLCHAIN
+  printf '%s\n' 'GOOS=linux GOARCH=amd64 CGO_ENABLED=0 -trimpath -buildvcs=false'
+} > "$bundle/review/BUILDINFO"
+(
+  cd "$bundle/review"
+  bash -n run-vm-security.sh
+  sha256sum rabiv-ingestor acquisition.test run-vm-security.sh \
+    source.tar SOURCE_COMMIT BUILDINFO > SHA256SUMS
+  sha256sum --strict -c SHA256SUMS
+)
 ```
 
 Owner reviews source, builds, hashes and transfers the Ingestor, tagged test binary,
@@ -271,7 +308,17 @@ Phase 3 acceptance still requires owner review, actual privileged VM enforcement
 results and applicable real-input adapter evidence. No production readiness,
 authenticated provenance, complete observation or publication authority is claimed.
 
-## Recorded implementation verification, 2026-11-22
+## Historical implementation verification, 2026-11-22
+
+The results below belong to the reviewed `e4e8d9e` bundle and listed hashes, not
+later binaries. Stage 1 changed Capture, correlation, Fetch acknowledgements and
+Worker error handling; Stage 2 changed their orchestration and the Ingestor CLI.
+Re-run the VM bundle before accepting the final Worker/Finalizer binary. The
+existing VM suite does not exercise live GitLab Fetch or production Collector
+capture/correlation; those retain local tests and historical input observations,
+not a new live-acquisition claim. Input storage, process privilege checks, Worker
+isolation adapter and Phase 1/2 enforcement code are unchanged from that baseline,
+but their composition with a modified Ingestor still needs re-verification.
 
 The owner authorized the isolated VM security scope and subsequently authorized
 the corrected `e4e8d9e` bundle. The prepared root batch pinned all transferred

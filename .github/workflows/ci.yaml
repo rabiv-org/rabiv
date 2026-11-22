@@ -41,6 +41,12 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Compile opt-in tests without executing binaries
+        run: go test -tags=rabiv_integration,rabiv_vmtest -exec=/usr/bin/true ./...
+
+      - name: Vet opt-in tests
+        run: go vet -tags=rabiv_integration,rabiv_vmtest ./...
+
       - name: Race tests
         run: go test -race ./...
 
@@ -69,3 +75,4 @@ jobs:
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version-file: .golangci-lint-version
+          args: --build-tags=rabiv_integration,rabiv_vmtest
