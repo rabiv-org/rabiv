@@ -179,6 +179,19 @@ Retained replay needs `RABIV_TEST_ARCHIVE`, `RABIV_TEST_ARCHIVE_SHA256` and JSON
 `RABIV_TEST_SUBJECTS` with `go test -tags=rabiv_integration ./test/phase3 -run
 TestRetainedArchive -count=1 -v`. No Gate A IDs/paths/versions are embedded in code.
 
+`TestPublicGitLabArtifact` uses `RABIV_TEST_GITLAB_INSTANCE`,
+`RABIV_TEST_GITLAB_PROJECT_ID`, `RABIV_TEST_GITLAB_JOB_ID`,
+`RABIV_TEST_ARCHIVE_SHA256` and JSON-array `RABIV_TEST_ARTIFACT_ORIGINS`.
+It performs bounded unauthenticated GETs for an already existing job. The supplied
+origins must have administrator approval before running this opt-in network test.
+
+`TestRetainedTetragonExport` requires `RABIV_TEST_TETRAGON_CAPTURE`,
+`RABIV_TEST_TETRAGON_SHA256` and independently recorded JSON-object
+`RABIV_TEST_TETRAGON_COUNTS`, keyed by normalized EventKind. It checks exact capture
+bytes and per-kind counts through the production stream adapter. Neither test
+creates jobs, loads tracing policies or acquires credentials. Both use the
+`rabiv_integration` build tag and skip when their required configuration is absent.
+
 ## Owner-controlled privileged verification (not automatically authorized)
 
 Build a review bundle on the host, without executing VM tests:
@@ -217,3 +230,78 @@ tests and successful property generation are not security acceptance evidence.
 Phase 3 acceptance still requires owner review, actual privileged VM enforcement
 results and applicable real-input adapter evidence. No production readiness,
 authenticated provenance, complete observation or publication authority is claimed.
+
+## Recorded implementation verification, 2026-11-22
+
+The owner authorized the isolated VM security scope and subsequently authorized
+the corrected `e4e8d9e` bundle. The prepared root batch pinned all transferred
+bytes before installing them into a fresh root-owned private review directory.
+SSH host-key verification stayed enabled. Sudo input used the reviewed local
+dialog/pipe mechanism, with terminal echo disabled, buffer clearing and sudo
+timestamp invalidation at completion. No API credential was used for these tests.
+
+The successful reviewed directory is
+`/var/lib/rabiv-phase3-reviewed.Uzg5hLb5`. It contains the bundle, `SHA256SUMS`
+and actual `report.txt`. Root-owned test assets remain under
+`/var/lib/rabiv-phase3-lab/run.2398685311`, mode 0700.
+
+| Reviewed bundle file | SHA-256 |
+| --- | --- |
+| rabiv-ingestor | e9e651b8557dc7c504a9d0718f5063e1f21235db11bbea27e2fcaae5372df65f |
+| acquisition.test | b0916ef3c9a781e6017970961ebd41f7be99cb38e5f819e680086003ce12f3a9 |
+| run-vm-security.sh | 5c45d9c5b5731997f46d8eb7f19da6adcba03f63eceff0fa43ab39804daf536d |
+
+The root test command was `bash run-vm-security.sh --confirm-dedicated-vm
+<reviewed-directory>`. `TestVMPhase3` passed in 3.74 seconds, with root batch exit
+0 and successful sudo timestamp invalidation. The suite created six distinct
+nonroot lab accounts, thirteen groups and seven channels. The owner-controlled
+Capture role used UID 0 in the synthetic channel permission test only.
+
+| Actual verification | Result and scope |
+| --- | --- |
+| All seven directed channels | Authorized writer Put/reader Get succeeded. Direct kernel opens denied readers lacking the dedicated group and denied attacker reads/writes. |
+| Private staging and symlinks | Assigned Worker could not read staged final-mode bytes. Input Get rejected a symlink in committed. |
+| Worker credentials and mounts | Actual IDs/groups, empty capabilities, no_new_privs, distinct network namespace and read-only Fetch checked by the running Worker. |
+| Worker OS probes | Credential sentinel inaccessible, decision/outside/tmp writes denied, host /run and /var/run sockets hidden, AF_INET socket creation denied, private workspace writable. |
+| Running cgroups | memory.max=2147483648, pids.max=64 and CPU quota at most 100% checked from inside the unit. |
+| Production Worker and Finalizer | Reviewed Ingestor ELF processed as an artifact, real installed Syft scanned it, Finalizer emitted a strict FINALIZED ArtifactManifest, and Verifier identity read the committed snapshot. |
+| Cleanup | Follow-up getent counts returned zero lab accounts/groups. systemctl listed no remaining rabiv-worker units. Evidence directories were root-owned 0700. |
+
+This VM test used a synthetic fetched CI claim and a reviewed local ELF. It proves
+the implemented Worker/Finalizer path and the listed Linux enforcement properties
+in that environment. Genuine CI identity, runtime causality, upstream trust and
+release authority require the later evaluation components and their own evidence.
+
+Two earlier attempts exposed implementation defects. The initial test fixture
+inherited umask 077 and failed its directory-mode preflight. Running the old
+bundle with the intended provisioning mask passed the channel checks, then exited
+226/NAMESPACE while setting up `InaccessiblePaths=/run`. The corrected fixture
+sets its provisioning mask explicitly. The Worker profile uses a private
+read-only tmpfs over host runtime paths and verifies the Ubuntu /var/run alias.
+Those corrections are committed in `e4e8d9e`; no permissions were loosened to
+bypass a failed assertion.
+
+Real-input adapter checks also passed. These observations are distinct from the
+synthetic VM harness and were obtained without starting additional CI jobs.
+
+| Check | Actual evidence |
+| --- | --- |
+| Go GitLab artifact adapter, existing job 18135779562 | 2815501 downloaded bytes, SHA-256 868e6bfd35fbf842e55597f389bdeab3b10085b5069a86aa8d9ea46eda5e5057. |
+| Go GitLab artifact adapter, existing job 18135779563 | 2815501 downloaded bytes, SHA-256 c5a1b0f9c9785001484681e0b94d758c76660508e66bfeed3e42fe6cf3db0459. |
+| Artifact redirect boundary | Production adapter allowed only HTTPS GitLab and the owner-approved cdn.artifacts.gitlab-static.net:443 origin, with TLS validation, three-redirect/32 MiB bounds and no API token. |
+| Retained Tetragon export | SHA-256 a25f84f23f6b0077cb22c001fcc3b662dff67f83b84a8e78c8d1c41da56e83e0. Go stream adapter accepted 3178 PROCESS_EXEC, 4047 PROCESS_EXIT, 2 FILE_WRITE_INTENT and 2 TCP_CONNECT records. |
+| Retained ZIP/provenance and Syft | Earlier Go replay checks matched three independently hashed artifact subjects/job and retained the invalid upstream dependency digest issue. The Go Syft adapter passed with the installed CLI after correcting its private config suffix to .yaml. |
+
+The artifact and Tetragon checks were rerun through reusable
+`TestPublicGitLabArtifact` and `TestRetainedTetragonExport` opt-in tests. Native
+Docker endpoints and live Tetragon capture were not reactivated during this
+implementation verification. Docker API compatibility has local Unix HTTP tests
+and the recorded Gate A observations. Fresh authenticated Go Jobs API acquisition
+was not exercised after the lab token expired. Unknown coverage/event loss remain
+explicit despite successful parsing and digest comparisons.
+
+Host verification passed on the pinned Go toolchain: fmt-check, unit/contract/
+functional tests, vet, race, default/tagged lint, build, govulncheck, module verify
+and tidy -diff. `govulncheck` reported no vulnerabilities found. Tagged VM tests
+remain excluded from ordinary go test/CI. The source and recorded results are
+ready for owner code review, with the live-acquisition limits above preserved.

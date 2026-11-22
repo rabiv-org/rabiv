@@ -1,6 +1,7 @@
 # ADR 0002: Bounded one-shot acquisition through directed input channels
 
-Status: implemented for Phase 3; privileged VM acceptance remains owner-controlled.
+Status: implemented for Phase 3. Owner-authorized Ubuntu VM security tests passed
+for source revision `e4e8d9e` on 2026-11-22. Owner code review remains pending.
 
 The four application binaries and ADR 0001 decision handoff remain unchanged.
 Collector and Ingestor publish input claims, never decision authority. Runtime
