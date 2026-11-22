@@ -43,6 +43,15 @@ discovery, retry loop or multi-channel transaction. Failed producer snapshots ar
 terminal inputs, not DENY or ALLOW. A process/storage failure without ACK must be
 reported by the invoker; durable timeout/recovery is Phase 4.
 
+Fetch stdout contains only committed **job snapshot** references under the
+optional `collector`, `worker` and `finalizer` keys. Zero-value references are
+omitted. Failure before the first snapshot commit emits no ACK and exits nonzero,
+even if unreferenced metadata/archive objects were already written. Partial
+delivery emits the committed references and exits nonzero; full delivery emits
+all three references and exits zero. A committed snapshot may itself describe a
+producer failure, so an ACK establishes storage completion, not acquisition
+success. Consumers must read the referenced snapshot state/failure metadata.
+
 `rabiv-ingestor fetch` requires `--collector-channel`, `--worker-channel`,
 `--finalizer-channel`, `--instance`, `--project-id`, `--job-id`, `--id`, and either
 `--credential-fd` or explicit `--public`. Credentials must arrive through an
@@ -84,6 +93,13 @@ witness, not verified hook availability/coverage. Actual file/TCP observations
 must be checked after jobs run. Default capture limits are 12 minutes, 64 MiB and
 100,000 records; these are configurable acquisition parameters, not security-policy
 invariants. Cancellation/EOF/oversize/malformed records preserve interruption/gaps.
+Non-EOF reader failures consume the capture work budget and retain sanitized
+`DOCKER_RECORD_ERROR`/`TETRAGON_RECORD_ERROR` diagnostics. A generic port error
+does not establish a truncated JSON record or a dropped-event count. Read-error
+budget exhaustion interrupts capture without inventing known drops. Parent
+cancellation stays explicit even if EOF wins the concurrent receive. A useful
+interrupted capture may be committed and ACKed with a nonzero capture exit status;
+its stored `interrupted` flag remains true and processing emits a FAILED manifest.
 
 `rabiv-collector process` requires capture/fetch/output channel configs,
 `--capture-ref`, repeated `--job-ref` metadata snapshot references, target fetched
@@ -109,6 +125,13 @@ paths reject whitespace/specifier characters for unambiguous systemd properties;
 this restriction does not apply to logical subject names. Profiles must be renewed
 after a host network-namespace identity change/reboot and reviewed before root use.
 
+The Worker application validates its snapshot ID/reference, exact nonempty unique
+subject selection and positive byte limits before I/O. Byte limits cannot exceed
+the input-store 1 GiB ceiling; adapters retain their narrower configured limits.
+Job/archive object-read errors, including storage and digest failures, propagate
+without a WorkerResult ACK. They are not converted into producer failure claims.
+An archive parser or scanner can still report an explicit production failure.
+
 ZIP defaults: 32 MiB transport, 16 MiB/entry, 48 MiB declared expanded total,
 1,024 entries, compression ratio 100. All entries are checked for duplicate names,
 unsafe paths, links/special files, unsupported encoding/encryption and limits.
@@ -123,8 +146,12 @@ projection and SHA-256 binding. Package count does not establish coverage.
 
 `rabiv-ingestor finalize` requires Finalizer Fetch/Worker/output channel configs,
 `--job-ref`, optional `--worker-ref`, `--workflow-id`, manifest `--id`, `--group-id`
-and repeated exact `--subject`. Missing/failed Worker input produces FAILED, not
-indefinite waiting. Wrong job/archive/subject bindings are rejected. Byte objects
+and repeated exact `--subject`. An absent `--worker-ref` produces FAILED with
+INPUT_UNAVAILABLE; a supplied valid WorkerResult carrying a producer failure also
+produces FAILED. A supplied reference whose object is missing/unreadable/corrupt,
+invalid WorkerResult JSON or wrong job/archive/subject binding returns an error
+without an ArtifactManifest ACK. These errors do not become producer failures.
+Byte objects
 are rehashed/copied into Ingestor storage before a strict ArtifactManifest ACK.
 Failures before an ACK can leave harmless unreferenced producer objects; automatic
 orphan cleanup/recovery is deferred.
@@ -137,6 +164,19 @@ unsupported; this is not generic file/network coverage. Source loss reports reta
 counts; reported zero does not establish zero loss over a capture. Throttle events
 preserve observation gaps. Overall coverage remains UNKNOWN. Known local drops are
 reported separately; overlapping source reports are not falsely summed as a total.
+When both local and source reports exist, the v1 EventLoss summary keeps
+LOSS_REPORTED with no purported total Count. The local count remains in the
+referenced capture's `dropped` field and source reports remain in its events and
+the evidence object's normalized result. A consumer needing those counts must
+resolve and hash-check those references.
+
+Gap summaries are capture-wide and conservative. Job manifests retain shared and
+unattributable gaps; they do not assert that every gap originated in that job.
+Per-job scopes/observation counts remain filtered to the intended job, and a job
+without observations retains UNRESOLVED_SCOPE even when another job has events.
+An observed ExecID with an unresolved scope is diagnosed as
+PROCESS_BINDING_UNRESOLVED, rather than asserted missing. Missing parent
+observations remain explicit through ParentExecID/ParentObserved.
 
 Correlation requires a unique full container candidate and actual runtime epoch.
 Variable prefixes are supported. StartedAt is only Docker State.StartedAt; missing
