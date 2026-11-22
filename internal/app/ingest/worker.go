@@ -131,8 +131,18 @@ func DecodeWorker(data []byte) (WorkerResult, error) {
 // Raw malformed provenance is stored before parsing and never silently repaired.
 func Process(ctx context.Context, fetch acquire.Source, out acquire.Sink, archive ArchiveReader, scanner Scanner, parser ProvenanceParser, jobRef artifact.ObjectReference, id string, names []string, maxArchive, maxSBOM int64) (artifact.ObjectReference, error) {
 	var zero artifact.ObjectReference
-	if artifact.ValidateID(id) != nil || len(names) == 0 || len(names) > 128 {
+	if artifact.ValidateID(id) != nil || jobRef.Validate() != nil || len(names) == 0 || len(names) > 128 || maxArchive <= 0 || maxArchive > 1<<30 || maxSBOM <= 0 || maxSBOM > 1<<30 {
 		return zero, errors.New("invalid worker request")
+	}
+	// Reuse domain validation for exact logical names and duplicate selection.
+	// The already validated reference digest is only a syntax-validation input
+	// here. Actual subject digests are computed from selected bytes below.
+	selection := make([]artifact.Subject, 0, len(names))
+	for _, name := range names {
+		selection = append(selection, artifact.Subject{Name: name, Digest: jobRef.Digest})
+	}
+	if err := artifact.ValidateSubjects(selection); err != nil {
+		return zero, errors.New("invalid worker subject selection")
 	}
 	b, err := fetch.Get(ctx, jobRef, 1<<20)
 	if err != nil {
@@ -158,8 +168,10 @@ func Process(ctx context.Context, fetch acquire.Source, out acquire.Sink, archiv
 	}
 	transport, err := fetch.Get(ctx, *job.Archive, maxArchive)
 	if err != nil {
-		r.Failure = acquire.Failure(err)
-		return finish()
+		// A referenced-object read can fail because of storage or integrity.
+		// Preserve that error, as for the job read above, instead of inventing
+		// a producer outcome from bytes we could not safely load.
+		return zero, err
 	}
 	contents, err := archive.Read(ctx, transport, names)
 	if err != nil {
