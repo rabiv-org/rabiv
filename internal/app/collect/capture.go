@@ -14,10 +14,15 @@ import (
 	"github.com/rabiv-org/rabiv/internal/domain/evidence"
 )
 
+// LifecycleStream supplies Docker observations. Close must unblock Next so
+// Capture can join its reader before returning.
 type LifecycleStream interface {
 	Next() (correlate.Container, error)
 	Close() error
 }
+
+// RuntimeStream supplies runtime observations with the same Close/Next lifetime
+// requirement as LifecycleStream.
 type RuntimeStream interface {
 	Next() (correlate.Event, error)
 	Close() error
@@ -30,8 +35,8 @@ type Docker interface {
 	Inspect(context.Context, string) (correlate.Container, error)
 }
 
-// Ready means subscribed Docker headers and a telemetry witness, not active
-// file/network policies or complete coverage. Duration bounds one invocation.
+// CaptureConfig bounds one invocation. Ready means subscribed Docker headers
+// and a telemetry witness, not active file/network policies or complete coverage.
 type CaptureConfig struct {
 	ID, HostID, BootID          string
 	Duration, InventoryInterval time.Duration
@@ -107,6 +112,8 @@ type captureState struct {
 	ready     bool
 }
 
+// observe serializes evidence updates and permits only one outstanding inventory
+// request. Cancellation and reader joining remain owned by Capture.
 func (s *captureState) observe(ctx context.Context, docker Docker, containers <-chan message[correlate.Container], events <-chan message[correlate.Event], wg *sync.WaitGroup) error {
 	inventories := make(chan message[[]correlate.Container], 1)
 	query := func() {

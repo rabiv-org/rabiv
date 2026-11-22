@@ -93,6 +93,25 @@ func TestCaptureByteBudgetPreservesUnknownCoverage(t *testing.T) {
 	}
 }
 
+func TestSourceReportsDoNotEstablishCaptureReadiness(t *testing.T) {
+	count := uint64(7)
+	for _, kind := range []correlate.EventKind{correlate.Unsupported, correlate.SourceLoss} {
+		t.Run(string(kind), func(t *testing.T) {
+			e := correlate.Event{Kind: kind, At: time.Now().UTC(), Source: "TETRAGON"}
+			if kind == correlate.SourceLoss {
+				e.LossCount = &count
+			}
+			d := &dockerSource{t: t, stream: &lifecycle{done: make(chan struct{})}}
+			runtime := &heldRuntime{lifecycle: lifecycle{done: make(chan struct{})}, events: []correlate.Event{e}}
+			ready := false
+			c, err := Capture(context.Background(), CaptureConfig{ID: "capture", HostID: "host", BootID: "boot", Duration: 10 * time.Millisecond, InventoryInterval: time.Millisecond, MaxBytes: 1 << 20, MaxRecords: 100, Ready: func() { ready = true }}, d, runtime)
+			if err == nil || ready || !c.Interrupted || len(c.Events) != 1 {
+				t.Fatalf("source report became readiness: capture=%+v ready=%v err=%v", c, ready, err)
+			}
+		})
+	}
+}
+
 type dockerSource struct {
 	mu         sync.Mutex
 	subscribed bool
