@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -20,6 +21,56 @@ import (
 	"github.com/rabiv-org/rabiv/internal/app/ingest"
 	"github.com/rabiv-org/rabiv/internal/domain/artifact"
 )
+
+func TestCredentialBoundsAndSanitizedFailures(t *testing.T) {
+	const sentinel = "synthetic-sensitive-value"
+	for _, tc := range []struct {
+		name, input string
+		valid       bool
+	}{
+		{"empty", "", false},
+		{"newline_only", "\r\n", false},
+		{"nul", sentinel + "\x00", false},
+		{"embedded_newline", sentinel + "\nother", false},
+		{"space", sentinel + " ", false},
+		{"unicode", sentinel + "中", false},
+		{"oversize", strings.Repeat("x", 4097), false},
+		{"exact_limit", strings.Repeat("x", 4096), true},
+		{"crlf", sentinel + "\r\n", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, w, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			fd, err := syscall.Dup(int(r.Fd()))
+			_ = r.Close()
+			if err != nil {
+				_ = w.Close()
+				t.Fatal(err)
+			}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				defer func() { _ = w.Close() }()
+				_, _ = io.WriteString(w, tc.input)
+			}()
+			token, err := credential(fd)
+			clear(token)
+			<-done
+			if (err == nil) != tc.valid || !tc.valid && token != nil {
+				t.Fatal("credential input boundary changed")
+			}
+			if err != nil && strings.Contains(err.Error(), sentinel) {
+				t.Fatal("credential appeared in error output")
+			}
+			var st syscall.Stat_t
+			if err := syscall.Fstat(fd, &st); !errors.Is(err, syscall.EBADF) {
+				t.Fatal("consumed credential descriptor remained open")
+			}
+		})
+	}
+}
 
 func TestFetchChannelsRequireSeparateReadersAndOneWriter(t *testing.T) {
 	base := [3]input.Config{

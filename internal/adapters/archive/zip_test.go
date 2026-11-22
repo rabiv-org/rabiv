@@ -9,6 +9,33 @@ import (
 	"testing"
 )
 
+func FuzzArchiveSelection(f *testing.F) {
+	var seed bytes.Buffer
+	w := zip.NewWriter(&seed)
+	entry, err := w.Create("subject")
+	if err != nil {
+		f.Fatal(err)
+	}
+	if _, err = entry.Write([]byte("bounded subject")); err != nil {
+		f.Fatal(err)
+	}
+	if err = w.Close(); err != nil {
+		f.Fatal(err)
+	}
+	f.Add(seed.Bytes())
+	f.Add([]byte("invalid zip"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 64<<10 {
+			t.Skip()
+		}
+		r := Reader{Limits: Limits{Archive: 64 << 10, Entry: 4096, Expanded: 8192, Entries: 16, Ratio: 100}}
+		c, err := r.Read(context.Background(), data, []string{"subject"})
+		if err == nil && (len(c.Subjects) != 1 || c.Subjects[0].Name != "subject" || len(c.Subjects[0].Bytes) > 4096) {
+			t.Fatal("successful ZIP selection violated bounds or exact identity")
+		}
+	})
+}
+
 func zipBytes(t *testing.T, names []string, mode fs.FileMode, body string) []byte {
 	t.Helper()
 	var b bytes.Buffer

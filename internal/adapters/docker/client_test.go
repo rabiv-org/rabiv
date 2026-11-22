@@ -7,6 +7,23 @@ import (
 	"time"
 )
 
+func FuzzParseInspect(f *testing.F) {
+	id := strings.Repeat("c", 64)
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	f.Add([]byte(fmt.Sprintf(`{"Id":%q,"Config":{"Labels":{}},"State":{}}`, id)))
+	f.Add([]byte(`{}`))
+	f.Add([]byte(`{`))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 8192 {
+			t.Skip()
+		}
+		v, err := ParseInspect(data, id, at)
+		if err == nil && (v.ID != id || !v.At.Equal(at)) {
+			t.Fatal("inspect changed canonical ID or discovery time")
+		}
+	})
+}
+
 func TestNativeLifecyclePrecisionAndSanitization(t *testing.T) {
 	id := strings.Repeat("b", 64)
 	raw := fmt.Sprintf(`{"Type":"container","Action":"exec_create: do-not-store-secret","time":1767323045,"timeNano":1767323045123456789,"Actor":{"ID":%q,"Attributes":{"com.gitlab.gitlab-runner.job.id":"82","com.gitlab.gitlab-runner.type":"predefined","other":"do-not-store"}}}`, id)

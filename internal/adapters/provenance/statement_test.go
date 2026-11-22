@@ -11,6 +11,22 @@ import (
 	domain "github.com/rabiv-org/rabiv/internal/domain/provenance"
 )
 
+func FuzzParse(f *testing.F) {
+	f.Add([]byte(fmt.Sprintf(`{"_type":"https://in-toto.io/Statement/v1","predicateType":"https://slsa.dev/provenance/v1","subject":[{"name":"subject","digest":{"sha256":%q}}],"predicate":{}}`, strings.Repeat("a", 64))))
+	f.Add([]byte(`{"predicate":null}`))
+	f.Add([]byte(`{`))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 8192 {
+			t.Skip()
+		}
+		ref := artifact.ObjectReference{ID: "raw-provenance", Digest: acquire.Hash(data)}
+		p, _ := (Parser{}).Parse(data, ref)
+		if p != nil && (p.Validate() != nil || !p.Reference.Equal(ref) || p.OriginStatus != "UNAUTHENTICATED" || p.AuthenticationRef != nil || p.ClaimedBuild != nil) {
+			t.Fatal("parsed projection fabricated integrity or origin assurance")
+		}
+	})
+}
+
 func TestRunnerInvalidDependencyPreserved(t *testing.T) {
 	raw := fmt.Sprintf(`{"_type":"https://in-toto.io/Statement/v0.1","predicateType":"https://slsa.dev/provenance/v1","subject":[{"name":"dist/中","digest":{"sha256":%q}}],"predicate":{"buildDefinition":{"resolvedDependencies":[{"digest":{"sha256":%q}}]}}}`, strings.Repeat("a", 64), strings.Repeat("b", 40))
 	ref := artifact.ObjectReference{ID: "raw", Digest: acquire.Hash([]byte(raw))}

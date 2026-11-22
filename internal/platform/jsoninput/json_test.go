@@ -1,6 +1,41 @@
 package jsoninput
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+	"unicode/utf8"
+)
+
+func FuzzDecode(f *testing.F) {
+	for _, raw := range []string{`{"name":"中/😀/�"}`, `{"name":"\ud800"}`, `{"name":"a","name":"b"}`, `{"name":null}`, `{`, `[]`} {
+		f.Add([]byte(raw), true)
+		f.Add([]byte(raw), false)
+	}
+	f.Fuzz(func(t *testing.T, data []byte, closed bool) {
+		if len(data) > 8192 {
+			t.Skip()
+		}
+		var v struct {
+			Name string `json:"name"`
+		}
+		if Decode(data, &v, closed) != nil {
+			return
+		}
+		if !utf8.ValidString(v.Name) {
+			t.Fatal("invalid decoded identity")
+		}
+		encoded, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var roundTrip struct {
+			Name string `json:"name"`
+		}
+		if Decode(encoded, &roundTrip, true) != nil || roundTrip.Name != v.Name {
+			t.Fatal("valid identity changed during strict round trip")
+		}
+	})
+}
 
 func TestDecode(t *testing.T) {
 	for _, tc := range []struct {

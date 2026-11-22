@@ -9,6 +9,24 @@ import (
 	"github.com/rabiv-org/rabiv/internal/app/correlate"
 )
 
+func FuzzNormalize(f *testing.F) {
+	for _, raw := range []string{`{"time":"2026-01-02T03:04:05Z","process_exec":{"process":{"exec_id":"exec"}}}`, `{"time":"2026-01-02T03:04:05Z","rate_limit_info":{"number_of_dropped_process_events":"7"}}`, `{`, `{"time":null}`} {
+		f.Add([]byte(raw))
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) > 8192 {
+			t.Skip()
+		}
+		e, err := Normalize(data, 8192)
+		if err != nil {
+			return
+		}
+		if e.At.IsZero() || e.Source != "TETRAGON" || (e.Kind == correlate.SourceLoss) != (e.LossCount != nil) {
+			t.Fatal("accepted event violated source/time/loss representation")
+		}
+	})
+}
+
 func TestNativeProfile(t *testing.T) {
 	for _, tc := range []struct {
 		name, kind, fields string
