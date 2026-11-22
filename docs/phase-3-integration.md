@@ -266,7 +266,7 @@ tar -xf "$bundle/review/source.tar" -C "$bundle/source"
   go test -trimpath -buildvcs=false -tags=rabiv_vmtest \
     -c ./test/phase3 -o "$bundle/review/acquisition.test"
 )
-cp "$bundle/source/test/phase3/run-vm-security.sh" "$bundle/review/"
+cp "$bundle/source/test/phase3/"{run-vm-security.sh,vm_lab.py,vm_receive.py} "$bundle/review/"
 printf '%s\n' "$revision" > "$bundle/review/SOURCE_COMMIT"
 {
   go version
@@ -276,33 +276,27 @@ printf '%s\n' "$revision" > "$bundle/review/SOURCE_COMMIT"
 (
   cd "$bundle/review"
   bash -n run-vm-security.sh
-  sha256sum rabiv-ingestor acquisition.test run-vm-security.sh \
+  sha256sum rabiv-ingestor acquisition.test run-vm-security.sh vm_lab.py vm_receive.py \
     source.tar SOURCE_COMMIT BUILDINFO > SHA256SUMS
   sha256sum --strict -c SHA256SUMS
 )
 ```
 
-Owner reviews source, builds, hashes and transfers the Ingestor, tagged test binary,
-script and SHA256SUMS using strict SSH host-key verification. Install the exact
-reviewed files into a fresh root-owned private directory under root-controlled
-ancestors; verify hashes again there before execution. Never sudo an upload from
-a user-writable directory. The prepared script requires installed Syft and the
-existing standard account/systemd/ACL tools; it installs nothing itself.
+The review bundle contains the two Linux ELFs, the runner, `vm_lab.py`,
+`vm_receive.py`, the committed source archive, SOURCE_COMMIT, BUILDINFO and
+SHA256SUMS. See [the concrete execution/recovery procedure](phase-3-vm-execution.md)
+for strict SSH, native interactive sudo, pinned receiver installation and report
+privacy. Neither building nor reviewing the bundle authorizes those VM operations.
 
-Only after explicit approval, on the dedicated Ubuntu VM:
+The external supervisor owns six lab accounts, thirteen groups, seven channels
+and two units. Reports/journal are root-private from creation. Cancellation and
+an eight-minute work deadline lead to separate bounded recovery before the Go
+suite's ten-minute fallback. SIGKILL/VM failure still need manual recovery.
 
-```bash
-sudo bash /ROOT_OWNED_REVIEWED_BUNDLE/run-vm-security.sh \
-  --confirm-dedicated-vm /ROOT_OWNED_REVIEWED_BUNDLE
-```
-
-It checks Ubuntu 24.04/KVM/guest ext4, root-owned artifacts, hashes, ACLs and tools
-before lab account operations. It creates distinct lab identities/channels and
-temporary transient units. No production accounts/services, CI resources, tracing
-policies or Docker/Tetragon endpoints are modified. Cleanup affects only created
-principals and private resources; root-private run reports/assets remain for review.
-Keep the actual test stdout and exit code with source/build revision. Default/skipped
-tests and successful property generation are not security acceptance evidence.
+The new test-only unit launcher reuses production profile arguments and runs the
+production Worker/Finalizer, but does not use `worker.Launch` cancellation cleanup.
+That production description-only unit guard remains unchanged under the approved
+harness-only scope; these VM results must not be claimed to verify that branch.
 
 Phase 3 acceptance still requires owner review, actual privileged VM enforcement
 results and applicable real-input adapter evidence. No production readiness,

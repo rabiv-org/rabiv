@@ -32,6 +32,8 @@ make lint
 ```
 
 Default tests use local fixtures and do not start CI jobs or privileged VM tests.
+Unprivileged VM harness/receiver regressions also require `/usr/bin/python3`
+(standard library only); they mock account and systemd operations.
 Compile and statically check all opt-in tests without running their binaries:
 
 ```bash
