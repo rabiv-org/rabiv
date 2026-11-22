@@ -5,7 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"syscall"
 	"testing"
 
@@ -13,6 +16,51 @@ import (
 	"github.com/rabiv-org/rabiv/internal/app/ingest"
 	"github.com/rabiv-org/rabiv/internal/domain/artifact"
 )
+
+func TestFetchRejectsSetupBeforeReadingCredential(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = r.Close() }()
+	if _, err = w.Write([]byte("synthetic-only\n")); err != nil {
+		t.Fatal(err)
+	}
+	_ = w.Close()
+	var out bytes.Buffer
+	err = run(context.Background(), []string{"fetch", "--credential-fd", fmt.Sprint(r.Fd()), "--collector-channel", filepath.Join(t.TempDir(), "untrusted.json")}, &out)
+	if err == nil || out.Len() != 0 {
+		t.Fatal("untrusted channel setup produced an acknowledgement")
+	}
+	b, err := io.ReadAll(r)
+	if err != nil || string(b) != "synthetic-only\n" {
+		t.Fatal("credential consumed or closed before channel preflight")
+	}
+}
+
+func TestWorkerChecksProfileBeforeReadingRequest(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = r.Close() }()
+	if _, err = w.Write([]byte(`["--subject","dist/中 app.bin"]`)); err != nil {
+		t.Fatal(err)
+	}
+	_ = w.Close()
+	stdin := os.Stdin
+	os.Stdin = r
+	t.Cleanup(func() { os.Stdin = stdin })
+	var out bytes.Buffer
+	err = run(context.Background(), []string{"worker", "--profile", filepath.Join(t.TempDir(), "untrusted.json"), "--request-stdin"}, &out)
+	if err == nil || out.Len() != 0 {
+		t.Fatal("untrusted profile was accepted")
+	}
+	b, err := io.ReadAll(r)
+	if err != nil || len(b) == 0 {
+		t.Fatal("request consumed before checking the profile")
+	}
+}
 
 func TestCommandsFailClosedWithoutSetup(t *testing.T) {
 	for _, args := range [][]string{nil, {"allow"}, {"publish"}, {"fetch", "--token", "not-a-real-token"}, {"worker", "--force"}, {"worker-run"}, {"finalize", "--verdict", "ALLOW"}, {"worker", "--profile", "/untrusted/profile.json"}} {

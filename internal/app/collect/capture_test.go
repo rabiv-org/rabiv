@@ -42,6 +42,57 @@ func (s *runtimeStream) Next() (correlate.Event, error) {
 }
 func (s *runtimeStream) Close() error { return nil }
 
+// heldRuntime distinguishes a completed bounded window from premature EOF.
+type heldRuntime struct {
+	lifecycle
+	events []correlate.Event
+}
+
+func (s *heldRuntime) Next() (correlate.Event, error) {
+	if len(s.events) == 0 {
+		<-s.done
+		return correlate.Event{}, io.EOF
+	}
+	e := s.events[0]
+	s.events = s.events[1:]
+	return e, nil
+}
+
+func TestCaptureBoundedWindowReadinessAndCleanup(t *testing.T) {
+	closed := &lifecycle{done: make(chan struct{})}
+	d := &dockerSource{t: t, stream: closed}
+	at := time.Now().UTC()
+	loss := uint64(7)
+	runtime := &heldRuntime{lifecycle: lifecycle{done: make(chan struct{})}, events: []correlate.Event{
+		{Kind: correlate.Unsupported, At: at, Source: "TETRAGON"},
+		{Kind: correlate.SourceLoss, At: at, Source: "TETRAGON", LossCount: &loss},
+		{Kind: correlate.ProcessExec, At: at, Source: "TETRAGON", ExecID: "witness"},
+		{Kind: correlate.ProcessExit, At: at, Source: "TETRAGON", ExecID: "witness"},
+	}}
+	ready := 0
+	c, err := Capture(context.Background(), CaptureConfig{ID: "capture", HostID: "host", BootID: "boot", Duration: 30 * time.Millisecond, InventoryInterval: time.Millisecond, MaxBytes: 1 << 20, MaxRecords: 100, Ready: func() { ready++ }}, d, runtime)
+	if err != nil || c.Interrupted || c.Dropped != 0 || ready != 1 || len(c.Events) != 4 || c.Validate() != nil {
+		t.Fatalf("bounded window changed: ready=%d capture=%+v err=%v", ready, c, err)
+	}
+	for _, done := range []<-chan struct{}{closed.done, runtime.done} {
+		select {
+		case <-done:
+		default:
+			t.Fatal("capture returned without closing a stream")
+		}
+	}
+}
+
+func TestCaptureByteBudgetPreservesUnknownCoverage(t *testing.T) {
+	d := &dockerSource{t: t, stream: &lifecycle{done: make(chan struct{})}}
+	runtime := &heldRuntime{lifecycle: lifecycle{done: make(chan struct{})}, events: []correlate.Event{{Kind: correlate.ProcessExec, At: time.Now().UTC(), Source: "TETRAGON", ExecID: "oversized", Binary: strings.Repeat("x", 4096)}}}
+	ready := false
+	c, err := Capture(context.Background(), CaptureConfig{ID: "capture", HostID: "host", BootID: "boot", Duration: time.Second, InventoryInterval: time.Second, MaxBytes: 4096, MaxRecords: 100, Ready: func() { ready = true }}, d, runtime)
+	if err == nil || !c.Interrupted || c.Dropped != 1 || len(c.Events) != 0 || ready {
+		t.Fatalf("byte limit changed: ready=%v capture=%+v err=%v", ready, c, err)
+	}
+}
+
 type dockerSource struct {
 	mu         sync.Mutex
 	subscribed bool

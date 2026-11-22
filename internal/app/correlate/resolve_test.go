@@ -1,6 +1,9 @@
 package correlate
 
 import (
+	"bytes"
+	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -8,6 +11,68 @@ import (
 	"github.com/rabiv-org/rabiv/internal/domain/build"
 	"github.com/rabiv-org/rabiv/internal/domain/evidence"
 )
+
+func TestResolveEpochMergeAndInclusiveBoundaries(t *testing.T) {
+	c := fixtureCapture()
+	id := strings.Repeat("b", 64)
+	open := observation(id, "12", c.Window.From, time.Time{})
+	open.PipelineID, open.CommitSHA, open.RawRole = "", "", ""
+	closed := observation(id, "12", c.Window.From, c.Window.Until)
+	c.Containers = []Container{open, closed}
+	for _, at := range []time.Time{c.Window.From.Add(-time.Nanosecond), c.Window.From, c.Window.Until, c.Window.Until.Add(time.Nanosecond)} {
+		c.Events = append(c.Events, Event{Kind: ProcessExit, At: at, Source: "TETRAGON", ContainerID: id[:7]})
+	}
+	before, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := Resolve(c, []build.Context{target("12")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Scopes) != 1 || r.Scopes[0].Execution.EndedAt == nil || !r.Scopes[0].Execution.EndedAt.Equal(c.Window.Until) || r.Scopes[0].Execution.Role != build.RoleBuild {
+		t.Fatalf("epoch merge changed: %+v", r.Scopes)
+	}
+	for i, want := range []string{"UNRESOLVED", "MATCHED", "MATCHED", "UNRESOLVED"} {
+		if r.Events[i].Resolution != want {
+			t.Fatalf("boundary %d: got=%s want=%s", i, r.Events[i].Resolution, want)
+		}
+	}
+	after, err := json.Marshal(c)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatal("correlation modified its source evidence")
+	}
+}
+
+func TestResolvePreservesSourceReportsAndThrottle(t *testing.T) {
+	c := fixtureCapture()
+	id := strings.Repeat("b", 64)
+	c.Containers = []Container{observation(id, "12", c.Window.From, c.Window.Until)}
+	loss := uint64(7)
+	c.Events = []Event{
+		{Kind: SourceLoss, At: c.Window.From, Source: "TETRAGON", LossCount: &loss},
+		{Kind: Unsupported, NativeKind: "process_throttle", At: c.Window.From, Source: "TETRAGON", ContainerID: id[:19]},
+	}
+	c.Gaps = []evidence.Gap{{Code: evidence.TruncatedRecord}}
+	c.Diagnostics = []Diagnostic{{Code: "INPUT_DIAGNOSTIC", Count: 3}}
+	r, err := Resolve(c, []build.Context{target("12")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Events[0].Resolution != "SOURCE_REPORT" || r.Events[0].Event.LossCount == nil || *r.Events[0].Event.LossCount != loss || r.Events[1].Resolution != "MATCHED" || r.Events[1].ProcessObserved {
+		t.Fatalf("source reports became process assurance: %+v", r.Events)
+	}
+	for _, gap := range []evidence.GapCode{evidence.TruncatedRecord, evidence.ObservationInterrupted} {
+		if !slices.Contains(r.Gaps, evidence.Gap{Code: gap}) {
+			t.Fatalf("lost gap %s", gap)
+		}
+	}
+	for code, count := range map[string]uint64{"INPUT_DIAGNOSTIC": 3, "SOURCE_LOSS_REPORT": 1, "THROTTLE_OBSERVED": 1, "UNSUPPORTED_EVENT_KIND": 1} {
+		if !slices.Contains(r.Diagnostics, Diagnostic{Code: code, Count: count}) {
+			t.Fatalf("lost diagnostic %s", code)
+		}
+	}
+}
 
 func target(job string) build.Context {
 	return build.Context{Identity: build.Identity{Provider: build.GitLab, Instance: "https://ci.example", ProjectID: "6", JobID: job}, PipelineID: "91", Source: &build.SourceRevision{RepositoryURI: "https://ci.example/team/project", CommitSHA: strings.Repeat("a", 40)}}
