@@ -6,7 +6,6 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -259,184 +258,16 @@ func TestVMPhase3(t *testing.T) {
 	if e != nil || strings.TrimSpace(string(fs)) != "ext4" {
 		t.Fatal("guest ext4 required before mutation")
 	}
-	base := "/var/lib/rabiv-phase3-lab"
-	if e = os.Mkdir(base, 0755); e != nil && !errors.Is(e, os.ErrExist) {
-		t.Fatal(e)
-	}
-	i, e := os.Lstat(base)
-	if e != nil || !i.IsDir() || i.Mode().Perm() != 0755 || i.Sys().(*syscall.Stat_t).Uid != 0 {
-		t.Fatal("unsafe lab base")
-	}
-	fs, e = exec.Command("findmnt", "-n", "-o", "FSTYPE", "-T", base).Output()
-	if e != nil || strings.TrimSpace(string(fs)) != "ext4" {
-		t.Fatal("guest ext4 required")
-	}
-	root, e := os.MkdirTemp(base, "run.")
+	config := os.Getenv("RABIV_PHASE3_VM_CONFIG")
+	c, e := vmLoad(config)
 	if e != nil {
 		t.Fatal(e)
 	}
-	if e = os.Chmod(root, 0755); e != nil {
-		t.Fatal(e)
-	}
+	root := c.Root
 	t.Log("isolated evidence root:", root)
-	if e = os.WriteFile(filepath.Join(root, "authorized"), []byte("RABIV_PHASE3_VM_ONLY\n"), 0444); e != nil {
-		t.Fatal(e)
-	}
-	acl, e := exec.Command("getfacl", "-cp", root).Output()
-	if e != nil || strings.Count(strings.TrimSpace(string(acl)), "\n") != 2 {
-		t.Fatal("unexpected ACL entries")
-	}
-	c := vmConfig{Root: root, Binary: filepath.Join(root, "acquisition.test"), Ingestor: filepath.Join(root, "rabiv-ingestor"), Syft: syft, Actors: map[string]vmActor{}, Channels: map[string]string{}}
-	for src, dst := range map[string]string{exe: c.Binary, filepath.Join(bundle, "rabiv-ingestor"): c.Ingestor} {
-		b, e := os.ReadFile(src)
-		if e != nil {
-			t.Fatal(e)
-		}
-		if e = os.WriteFile(dst, b, 0555); e != nil {
-			t.Fatal(e)
-		}
-	}
-	command := func(name string, args ...string) []byte {
-		t.Helper()
-		cmd := exec.Command(name, args...)
-		cmd.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C.UTF-8"}
-		b, e := cmd.CombinedOutput()
-		if e != nil {
-			t.Fatalf("%s failed (%T)", name, e)
-		}
-		return b
-	}
-	var users, groups []string
-	baselineUIDs := map[int]bool{}
-	procEntries, e := os.ReadDir("/proc")
-	if e != nil {
-		t.Fatal(e)
-	}
-	for _, entry := range procEntries {
-		if _, e := strconv.Atoi(entry.Name()); e != nil {
-			continue
-		}
-		status, e := os.ReadFile(filepath.Join("/proc", entry.Name(), "status"))
-		if e != nil {
-			continue
-		}
-		for _, line := range strings.Split(string(status), "\n") {
-			if strings.HasPrefix(line, "Uid:") {
-				for _, value := range strings.Fields(strings.TrimPrefix(line, "Uid:")) {
-					uid, e := strconv.Atoi(value)
-					if e == nil {
-						baselineUIDs[uid] = true
-					}
-				}
-			}
-		}
-	}
-	createdUIDs := map[string]int{}
-	t.Cleanup(func() {
-		for _, name := range users {
-			if b, e := exec.Command("id", "-u", name).Output(); e == nil {
-				uid := strings.TrimSpace(string(b))
-				n, e := strconv.Atoi(uid)
-				if e != nil || createdUIDs[name] != n || baselineUIDs[n] {
-					t.Errorf("unsafe cleanup UID for %s; no process/account removal attempted", name)
-					continue
-				}
-				_ = exec.Command("pkill", "-TERM", "-u", uid).Run()
-				time.Sleep(50 * time.Millisecond)
-				_ = exec.Command("pkill", "-KILL", "-u", uid).Run()
-			}
-			if e := exec.Command("userdel", name).Run(); e != nil {
-				t.Errorf("cleanup user %s: %v", name, e)
-			}
-		}
-		for _, name := range groups {
-			if exec.Command("getent", "group", name).Run() == nil {
-				if e := exec.Command("groupdel", name).Run(); e != nil {
-					t.Errorf("cleanup group %s: %v", name, e)
-				}
-			}
-		}
-		if e := os.Chmod(root, 0700); e != nil {
-			t.Error(e)
-		}
-	})
-	tag := strings.ToLower(rand.Text()[:8])
-	group := func(label string) int {
-		name := "r3" + label + tag
-		command("groupadd", "--system", name)
-		groups = append(groups, name)
-		out := command("getent", "group", name)
-		parts := strings.Split(string(out), ":")
-		gid, e := strconv.Atoi(parts[2])
-		if e != nil {
-			t.Fatal(e)
-		}
-		return gid
-	}
-	for _, role := range []string{"fetch", "collector", "worker", "finalizer", "verifier", "attacker"} {
-		gid := group(role[:2])
-		name := "r3" + role[:2] + tag
-		command("useradd", "--system", "--gid", strconv.Itoa(gid), "--no-create-home", "--shell", "/usr/sbin/nologin", name)
-		users = append(users, name)
-		uid, e := strconv.Atoi(strings.TrimSpace(string(command("id", "-u", name))))
-		if e != nil {
-			t.Fatal(e)
-		}
-		createdUIDs[name] = uid
-		if baselineUIDs[uid] {
-			t.Fatal("allocated lab UID already used by an existing process; no tests will use it")
-		}
-		c.Actors[role] = vmActor{UID: uid, GID: gid}
-	}
+	var data []byte
 	type directed struct{ key, writer, reader string }
-	c.Actors["capture"] = vmActor{UID: 0, GID: 0}
 	channels := []directed{{"fetch_collector", "fetch", "collector"}, {"fetch_worker", "fetch", "worker"}, {"fetch_finalizer", "fetch", "finalizer"}, {"worker_finalizer", "worker", "finalizer"}, {"collector_verifier", "collector", "verifier"}, {"ingestor_verifier", "finalizer", "verifier"}, {"capture_collector", "capture", "collector"}}
-	for n, ch := range channels {
-		g := group("c" + strconv.Itoa(n))
-		w, r := c.Actors[ch.writer], c.Actors[ch.reader]
-		w.Groups = append(w.Groups, g)
-		r.Groups = append(r.Groups, g)
-		c.Actors[ch.writer] = w
-		c.Actors[ch.reader] = r
-		dir := filepath.Join(root, ch.key)
-		if e = os.Mkdir(dir, 0755); e != nil {
-			t.Fatal(e)
-		}
-		for name, mode := range map[string]os.FileMode{"staging": 0700, "committed": 0750 | os.ModeSetgid} {
-			p := filepath.Join(dir, name)
-			if e = os.Mkdir(p, 0700); e != nil {
-				t.Fatal(e)
-			}
-			gid := w.GID
-			if name == "committed" {
-				gid = g
-			}
-			if e = os.Chown(p, w.UID, gid); e != nil {
-				t.Fatal(e)
-			}
-			if e = os.Chmod(p, mode); e != nil {
-				t.Fatal(e)
-			}
-		}
-		cfg := input.Config{RootDir: dir, WriterUID: w.UID, WriterGID: w.GID, ReaderUID: r.UID, ReaderPrimaryGID: r.GID, ReaderGID: g}
-		path := filepath.Join(root, ch.key+".json")
-		b, e := json.Marshal(cfg)
-		if e != nil {
-			t.Fatal(e)
-		}
-		if e = os.WriteFile(path, b, 0444); e != nil {
-			t.Fatal(e)
-		}
-		c.Channels[ch.key] = path
-	}
-	config := filepath.Join(root, "vm.json")
-	b, e := json.Marshal(c)
-	if e != nil {
-		t.Fatal(e)
-	}
-	if e = os.WriteFile(config, b, 0444); e != nil {
-		t.Fatal(e)
-	}
 	actor := func(role string, emptyGroups bool, exe string, args []string, stdin []byte, extra ...string) ([]byte, error) {
 		a := c.Actors[role]
 		argv := []string{"--reuid", strconv.Itoa(a.UID), "--regid", strconv.Itoa(a.GID), "--no-new-privs", "--bounding-set=-all", "--inh-caps=-all", "--ambient-caps=-all"}
@@ -498,7 +329,7 @@ func TestVMPhase3(t *testing.T) {
 	}
 	// Direct kernel checks for private staging and syscall-level symlink refusal.
 	var fw input.Config
-	data, e := os.ReadFile(c.Channels["fetch_worker"])
+	data, e = os.ReadFile(c.Channels["fetch_worker"])
 	if e != nil || json.Unmarshal(data, &fw) != nil {
 		t.Fatal("channel config")
 	}
@@ -560,7 +391,7 @@ func TestVMPhase3(t *testing.T) {
 	if e = os.WriteFile(profile, data, 0444); e != nil {
 		t.Fatal(e)
 	}
-	probe, e := worker.Launch(context.Background(), profile, []string{})
+	probe, e := launchVMLab(context.Background(), bundle, "probe", profile, []string{})
 	if e != nil {
 		t.Fatal("actual worker OS probe failed", e)
 	}
@@ -618,7 +449,7 @@ func TestVMPhase3(t *testing.T) {
 	if e = os.WriteFile(profile, data, 0444); e != nil {
 		t.Fatal(e)
 	}
-	raw, e := worker.Launch(context.Background(), profile, []string{"--fetch-channel", c.Channels["fetch_worker"], "--output-channel", c.Channels["worker_finalizer"], "--job-ref", jobRef.ID + "@" + jobRef.Digest.Value, "--id", "processed", "--subject", "out/probe", "--max-entry", "33554432", "--max-expanded", "67108864"})
+	raw, e := launchVMLab(context.Background(), bundle, "worker", profile, []string{"--fetch-channel", c.Channels["fetch_worker"], "--output-channel", c.Channels["worker_finalizer"], "--job-ref", jobRef.ID + "@" + jobRef.Digest.Value, "--id", "processed", "--subject", "out/probe", "--max-entry", "33554432", "--max-expanded", "67108864"})
 	if e != nil {
 		t.Fatal("production isolated Worker failed", e)
 	}
