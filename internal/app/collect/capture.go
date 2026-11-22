@@ -48,6 +48,9 @@ func pump[T any](ctx context.Context, wg *sync.WaitGroup, next func() (T, error)
 	wg.Go(func() {
 		defer close(ch)
 		for {
+			if ctx.Err() != nil {
+				return
+			}
 			v, e := next()
 			select {
 			case ch <- message[T]{v, e}:
@@ -136,8 +139,13 @@ loop:
 				break loop
 			}
 			if m.err != nil {
-				gaps[evidence.TruncatedRecord] = true
-				counts["MALFORMED_DOCKER_RECORD"]++
+				// Charge failed reads to the same record/byte work budget. The
+				// port error alone does not establish JSON truncation or loss count.
+				if !add(correlate.Diagnostic{Code: "DOCKER_RECORD_ERROR", Count: 1}) {
+					break loop
+				}
+				gaps[evidence.ObservationInterrupted] = true
+				counts["DOCKER_RECORD_ERROR"]++
 				continue
 			}
 			if !add(m.value) {
@@ -166,8 +174,11 @@ loop:
 				break loop
 			}
 			if m.err != nil {
-				gaps[evidence.TruncatedRecord] = true
-				counts["MALFORMED_TETRAGON_RECORD"]++
+				if !add(correlate.Diagnostic{Code: "TETRAGON_RECORD_ERROR", Count: 1}) {
+					break loop
+				}
+				gaps[evidence.ObservationInterrupted] = true
+				counts["TETRAGON_RECORD_ERROR"]++
 				continue
 			}
 			if !add(m.value) {

@@ -79,7 +79,8 @@ func TestCaptureRaceOrderingAndInterruptedExport(t *testing.T) {
 	for _, g := range c.Gaps {
 		seen[g.Code] = true
 	}
-	if !seen[evidence.TruncatedRecord] || !seen[evidence.ObservationInterrupted] {
+	// A generic reader error gives no proof that a record was truncated.
+	if seen[evidence.TruncatedRecord] || !seen[evidence.ObservationInterrupted] {
 		t.Fatal("capture gap hidden")
 	}
 }
