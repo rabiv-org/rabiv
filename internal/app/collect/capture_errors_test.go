@@ -5,8 +5,10 @@ import (
 	"errors"
 	"io"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/rabiv-org/rabiv/internal/app/correlate"
@@ -74,7 +76,7 @@ func TestMalformedStreamsConsumeRecordBudget(t *testing.T) {
 				if diag.Code == "CAPTURE_LIMIT" {
 					limitHits += diag.Count
 				}
-				if diag.Code != "CAPTURE_LIMIT" && diag.Code != "NO_TELEMETRY_WITNESS" {
+				if diag.Code == "DOCKER_RECORD_ERROR" || diag.Code == "TETRAGON_RECORD_ERROR" {
 					recordErrors += diag.Count
 				}
 			}
@@ -120,11 +122,97 @@ func TestCancelledPumpDoesNotReadAgain(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var wg sync.WaitGroup
-	ch := pump(ctx, &wg, func() (correlate.Event, error) { t.Error("read after cancellation"); return correlate.Event{}, io.EOF })
+	stream := pump(ctx, &wg, func() (correlate.Event, error) { t.Error("read after cancellation"); return correlate.Event{}, io.EOF })
 	wg.Wait()
-	if _, ok := <-ch; ok {
+	if _, ok := <-stream.records; ok {
 		t.Fatal("record emitted after cancellation")
 	}
+}
+
+type inspectingDocker struct {
+	errorDocker
+	entered chan struct{}
+}
+
+func (d inspectingDocker) Inspect(ctx context.Context, _ string) (correlate.Container, error) {
+	close(d.entered)
+	<-ctx.Done()
+	return correlate.Container{}, ctx.Err()
+}
+
+type lifecycleStart struct {
+	lifecycle
+	onceStart bool
+}
+
+func (s *lifecycleStart) Next() (correlate.Container, error) {
+	if s.onceStart {
+		s.onceStart = false
+		return correlate.Container{ID: strings.Repeat("a", 64), At: time.Now().UTC(), Action: "start"}, nil
+	}
+	return s.lifecycle.Next()
+}
+
+type keyedRuntime struct {
+	heldRuntime
+	entered chan struct{}
+	queued  chan struct{}
+}
+
+func (s *keyedRuntime) Next() (correlate.Event, error) {
+	if len(s.events) > 0 {
+		<-s.entered
+		return s.heldRuntime.Next()
+	}
+	close(s.queued)
+	return s.heldRuntime.Next()
+}
+
+func TestCaptureDrainsWhileInspectBlocksReceiver(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entered, queued := make(chan struct{}), make(chan struct{})
+	d := inspectingDocker{errorDocker{&lifecycleStart{lifecycle{done: make(chan struct{})}, true}}, entered}
+	r := &keyedRuntime{heldRuntime{lifecycle: lifecycle{done: make(chan struct{})}, events: []correlate.Event{{Kind: correlate.ProcessExec, At: time.Now().UTC(), Source: "TETRAGON", ExecID: "queued"}}}, entered, queued}
+	go func() {
+		select {
+		case <-queued:
+			cancel() // The receiver is still in Inspect, which needs cancellation.
+		case <-ctx.Done():
+		}
+	}()
+	c, err := Capture(ctx, CaptureConfig{ID: "capture", HostID: "host", BootID: "boot", Duration: time.Second, InventoryInterval: time.Second, MaxBytes: 1 << 20, MaxRecords: 8, Ready: func() {
+		t.Error("advertised readiness during shutdown")
+	}}, d, r)
+	if !errors.Is(err, context.Canceled) || len(c.Events) != 1 || c.Events[0].ExecID != "queued" || c.Dropped != 0 || !c.Interrupted {
+		t.Fatalf("queued evidence lost: capture=%+v err=%v", c, err)
+	}
+}
+
+func TestPumpRetainsTerminalCauseBeforeReceiverDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+	early := pump(ctx, &wg, func() (correlate.Event, error) { return correlate.Event{}, io.EOF })
+	wg.Wait()
+	cancel() // Model a receiver that cannot observe termination until shutdown.
+	s := captureState{counts: map[string]uint64{}, gaps: map[evidence.GapCode]bool{}}
+	s.recordTerminal(early.premature, "TETRAGON_STREAM_ENDED")
+	if !s.snapshot.Interrupted || !s.gaps[evidence.ObservationInterrupted] || s.counts["TETRAGON_STREAM_ENDED"] != 1 {
+		t.Fatalf("premature EOF lost: %+v", s)
+	}
+}
+
+func TestCaptureDeadlineFinishesQueuedObservations(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		entered, queued := make(chan struct{}), make(chan struct{})
+		d := inspectingDocker{errorDocker{&lifecycleStart{lifecycle{done: make(chan struct{})}, true}}, entered}
+		r := &keyedRuntime{heldRuntime{lifecycle: lifecycle{done: make(chan struct{})}, events: []correlate.Event{{Kind: correlate.ProcessExec, At: time.Now().UTC(), Source: "TETRAGON", ExecID: "queued"}}}, entered, queued}
+		c, err := Capture(t.Context(), CaptureConfig{ID: "capture", HostID: "host", BootID: "boot", Duration: time.Second, InventoryInterval: time.Second, MaxBytes: 1 << 20, MaxRecords: 8}, d, r)
+		if err != nil || len(c.Events) != 1 || c.Interrupted || c.Dropped != 0 || c.Validate() != nil {
+			t.Fatalf("deadline did not preserve normal completion: %+v %v", c, err)
+		}
+	})
 }
 
 func TestCancellationWithReadyEOFRemainsInterrupted(t *testing.T) {

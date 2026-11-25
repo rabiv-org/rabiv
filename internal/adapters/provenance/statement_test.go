@@ -53,3 +53,11 @@ func TestNullPredicateRemainsAnInvalidRawClaim(t *testing.T) {
 		t.Fatal("null predicate presented as a supported projection")
 	}
 }
+
+func TestExactSubjectProjection(t *testing.T) {
+	raw := fmt.Appendf(nil, `{"_type":"https://in-toto.io/Statement/v1","predicateType":"https://slsa.dev/provenance/v1","subject":[{"name":"original","Name":"alias","digest":{"sha256":%q}}],"Subject":[],"predicate":{}}`, strings.Repeat("a", 64))
+	p, issues := (Parser{}).Parse(raw, artifact.ObjectReference{ID: "raw", Digest: acquire.Hash(raw)})
+	if p == nil || len(p.Subjects) != 1 || p.Subjects[0].Name != "original" || len(issues) != 0 {
+		t.Fatalf("case variant changed the canonical projection: %+v %v", p, issues)
+	}
+}

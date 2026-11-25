@@ -56,3 +56,28 @@ func TestInspectPreservesEpochsAndMissingState(t *testing.T) {
 		t.Fatal("accepted missing ID")
 	}
 }
+
+func TestInspectRestartEpoch(t *testing.T) {
+	id := strings.Repeat("c", 64)
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	start := at.Add(-time.Minute)
+	for _, tc := range []struct {
+		name     string
+		running  bool
+		finish   time.Time
+		endKnown bool
+		valid    bool
+	}{
+		{"running_restart", true, start.Add(-time.Second), false, true},
+		{"completed_epoch", false, start.Add(time.Second), true, true},
+		{"contradictory_stopped_epoch", false, start.Add(-time.Second), false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := fmt.Appendf(nil, `{"Id":%q,"State":{"Running":%t,"StartedAt":%q,"FinishedAt":%q}}`, id, tc.running, start.Format(time.RFC3339), tc.finish.Format(time.RFC3339))
+			got, err := ParseInspect(raw, id, at)
+			if (err == nil) != tc.valid || err == nil && (got.StartedAt == nil || !got.StartedAt.Equal(start) || (got.FinishedAt != nil) != tc.endKnown || tc.endKnown && !got.FinishedAt.Equal(tc.finish)) {
+				t.Fatalf("observation=%+v error=%v", got, err)
+			}
+		})
+	}
+}

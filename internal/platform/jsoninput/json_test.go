@@ -6,6 +6,18 @@ import (
 	"unicode/utf8"
 )
 
+func TestUpstreamExactKeys(t *testing.T) {
+	var v struct {
+		Item struct {
+			Name string `json:"name"`
+		} `json:"item"`
+	}
+	err := Decode([]byte(`{"item":{"name":"canonical","Name":"alias","future":null},"Item":{"name":"outer alias"}}`), &v, false)
+	if err != nil || v.Item.Name != "canonical" {
+		t.Fatalf("canonical field overwritten: %+v, %v", v, err)
+	}
+}
+
 func FuzzDecode(f *testing.F) {
 	for _, raw := range []string{`{"name":"中/😀/�"}`, `{"name":"\ud800"}`, `{"name":"a","name":"b"}`, `{"name":null}`, `{`, `[]`} {
 		f.Add([]byte(raw), true)

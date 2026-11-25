@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -236,5 +237,54 @@ func TestReportedLossDoesNotBecomeZeroLossOrComplete(t *testing.T) {
 		if manifest.Payload.EventLoss.Status != want || manifest.Payload.Coverage.Status != evidence.CoverageUnknown {
 			t.Fatal("loss/coverage uncertainty lost")
 		}
+	}
+}
+
+func TestProduceBoundedExpansionKeepsSourceAndLocalLossDistinct(t *testing.T) {
+	ctx := context.Background()
+	m := &memory{data: map[string][]byte{}}
+	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	job := build.Context{Identity: build.Identity{Provider: build.GitLab, Instance: "https://ci.example", ProjectID: "6", JobID: "12"}, PipelineID: "91", Source: &build.SourceRevision{RepositoryURI: "https://ci.example/team/project", CommitSHA: strings.Repeat("a", 40)}}
+	id := strings.Repeat("b", 64)
+	c := correlate.Capture{Version: "runtime-capture/v1", CaptureID: "capture", HostID: "host", BootID: "boot", Window: evidence.ObservationWindow{From: at, Until: at}, Containers: []correlate.Container{{ID: id, At: at, StartedAt: &at, JobID: "12", ProjectID: "6", PipelineID: "91", CommitSHA: job.Source.CommitSHA}}, Events: []correlate.Event{}, Gaps: []evidence.Gap{}, Diagnostics: []correlate.Diagnostic{}, Dropped: 2, Interrupted: true}
+	for range 10000 {
+		c.Events = append(c.Events, correlate.Event{Kind: correlate.ProcessExec, At: at, Source: "TETRAGON", ContainerID: id[:16], ExecID: "exec"})
+	}
+	loss := uint64(7)
+	c.Events = append(c.Events, correlate.Event{Kind: correlate.SourceLoss, At: at, Source: "TETRAGON", LossCount: &loss})
+	raw, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	captureRef, err := m.Put(ctx, "capture", bytes.NewReader(raw), int64(len(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := Produce(ctx, m, m, captureRef, []build.Context{job}, job.Identity, "workflow", "manifest", at, int64(len(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := v1.DecodeEvidenceManifest(m.data[ref.ID])
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := manifest.Payload
+	content := m.data[p.Reference.ID]
+	if len(content) <= len(raw)+(1<<20) || acquire.Hash(content) != p.Reference.Digest || p.EventLoss.Status != evidence.LossReported || p.EventLoss.Count != nil || p.Coverage.Status != evidence.CoverageUnknown || !slices.Contains(p.Gaps, evidence.Gap{Code: evidence.ObservationInterrupted}) {
+		t.Fatalf("expansion/loss summary incorrect: input=%d output=%d loss=%+v", len(raw), len(content), p.EventLoss)
+	}
+	var obj struct {
+		CaptureRef artifact.ObjectReference `json:"capture_ref"`
+		Result     correlate.Result         `json:"result"`
+	}
+	if err := json.Unmarshal(content, &obj); err != nil {
+		t.Fatal(err)
+	}
+	if !obj.CaptureRef.Equal(captureRef) || len(obj.Result.Events) != len(c.Events) || !slices.Contains(obj.Result.Diagnostics, correlate.Diagnostic{Code: "LOCAL_CAPTURE_DROPPED_RECORDS", Count: 2}) {
+		t.Fatal("referenced evidence lost recorded inputs")
+	}
+	report := obj.Result.Events[len(obj.Result.Events)-1]
+	if report.Event.LossCount == nil || *report.Event.LossCount != 7 || report.JobID != "" || report.ScopeID != "" {
+		t.Fatalf("source report was lost or attributed: %+v", report)
 	}
 }

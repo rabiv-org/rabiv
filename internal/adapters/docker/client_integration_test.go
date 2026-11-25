@@ -18,6 +18,7 @@ func TestReadOnlyUnixAPIAndSubscriptionHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := strings.Repeat("a", 64)
+	firstEvent := make(chan struct{})
 	server := &http.Server{ReadHeaderTimeout: time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			t.Error("mutating request")
@@ -32,7 +33,11 @@ func TestReadOnlyUnixAPIAndSubscriptionHeaders(t *testing.T) {
 		case "/v1.99/events":
 			w.WriteHeader(http.StatusOK)
 			w.(http.Flusher).Flush()
-			_, _ = fmt.Fprintf(w, "{\"Type\":\"container\",\"Action\":\"start\",\"timeNano\":1767323045123456789,\"Actor\":{\"ID\":%q}}\n", id)
+			select {
+			case <-firstEvent:
+				_, _ = fmt.Fprintf(w, "{\"Type\":\"container\",\"Action\":\"start\",\"timeNano\":1767323045123456789,\"Actor\":{\"ID\":%q}}\n", id)
+			case <-r.Context().Done():
+			}
 		default:
 			t.Errorf("unexpected endpoint %s", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -52,6 +57,7 @@ func TestReadOnlyUnixAPIAndSubscriptionHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = stream.Close() }()
+	close(firstEvent)
 	v, err := stream.Next()
 	if err != nil || v.Action != "start" || v.StartedAt != nil {
 		t.Fatalf("event: %+v %v", v, err)

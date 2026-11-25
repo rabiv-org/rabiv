@@ -154,8 +154,10 @@ func ParseInspect(data []byte, expectedID string, at time.Time) (correlate.Conta
 			Labels map[string]string `json:"Labels"`
 		} `json:"Config"`
 		State struct {
-			Started  time.Time `json:"StartedAt"`
-			Finished time.Time `json:"FinishedAt"`
+			Started    time.Time `json:"StartedAt"`
+			Finished   time.Time `json:"FinishedAt"`
+			Running    bool      `json:"Running"`
+			Restarting bool      `json:"Restarting"`
 		} `json:"State"`
 	}
 	var zero correlate.Container
@@ -177,7 +179,11 @@ func ParseInspect(data []byte, expectedID string, at time.Time) (correlate.Conta
 		o.FinishedAt = &raw.State.Finished
 	}
 	if o.StartedAt != nil && o.FinishedAt != nil && o.FinishedAt.Before(*o.StartedAt) {
-		return zero, ErrInput
+		if !raw.State.Running || raw.State.Restarting {
+			return zero, ErrInput
+		}
+		// Docker can retain the previous finish after the next execution starts.
+		o.FinishedAt = nil
 	}
 	return o, nil
 }
@@ -205,8 +211,8 @@ func (s *Stream) Close() error { return s.body.Close() }
 // not hide them or pass daemon action suffixes (which may contain argv) onward.
 func (s *Stream) Next() (correlate.Container, error) {
 	if !s.scanner.Scan() {
-		if s.scanner.Err() != nil {
-			return correlate.Container{}, io.ErrUnexpectedEOF
+		if err := s.scanner.Err(); err != nil {
+			return correlate.Container{}, errors.Join(collect.ErrStreamRead, err)
 		}
 		return correlate.Container{}, io.EOF
 	}

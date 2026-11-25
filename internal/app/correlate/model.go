@@ -38,6 +38,7 @@ const (
 	TCPConnect      EventKind = "TCP_CONNECT"
 	Unsupported     EventKind = "UNSUPPORTED"
 	SourceLoss      EventKind = "SOURCE_LOSS"
+	MaxExecIDBytes            = 1024
 )
 
 // Event excludes process arguments, environment, credentials and payload bytes.
@@ -106,7 +107,7 @@ func (c Capture) Validate() error {
 		}
 	}
 	for _, v := range c.Events {
-		if build.ValidateTime(v.At) != nil || v.Source == "" || len(v.ExecID) > 1024 || len(v.ParentExecID) > 1024 {
+		if build.ValidateTime(v.At) != nil || v.Source == "" || len(v.ExecID) > MaxExecIDBytes || len(v.ParentExecID) > MaxExecIDBytes {
 			return errors.New("invalid runtime event")
 		}
 		if v.ContainerID != "" && (build.ObservedContainerID{Runtime: "DOCKER", Value: v.ContainerID}).Validate() != nil {

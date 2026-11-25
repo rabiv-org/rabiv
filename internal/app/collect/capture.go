@@ -9,10 +9,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rabiv-org/rabiv/internal/app/acquire"
 	"github.com/rabiv-org/rabiv/internal/app/correlate"
 	"github.com/rabiv-org/rabiv/internal/domain/artifact"
 	"github.com/rabiv-org/rabiv/internal/domain/evidence"
 )
+
+// ErrStreamRead marks a terminal transport failure, as distinct from a
+// malformed record followed by more readable observations.
+var ErrStreamRead = errors.New("terminal capture stream read failure")
 
 // LifecycleStream supplies Docker observations. Close must unblock Next so
 // Capture can join its reader before returning.
@@ -49,26 +54,46 @@ type message[T any] struct {
 	err   error
 }
 
-func pump[T any](ctx context.Context, wg *sync.WaitGroup, next func() (T, error)) <-chan message[T] {
-	ch := make(chan message[T], 64)
+type streamPump[T any] struct {
+	records   chan message[T]
+	premature error
+	discarded bool
+}
+
+func pump[T any](ctx context.Context, wg *sync.WaitGroup, next func() (T, error)) *streamPump[T] {
+	s := &streamPump[T]{records: make(chan message[T], 64)}
 	wg.Go(func() {
-		defer close(ch)
-		for {
-			if ctx.Err() != nil {
-				return
-			}
+		defer close(s.records)
+		for ctx.Err() == nil {
 			v, e := next()
-			select {
-			case ch <- message[T]{v, e}:
-			case <-ctx.Done():
+			if isTerminal(e) {
+				deadline, bounded := ctx.Deadline()
+				if ctx.Err() == nil && (!bounded || time.Now().Before(deadline)) {
+					s.premature = e
+				}
 				return
 			}
-			if errors.Is(e, io.EOF) || errors.Is(e, io.ErrUnexpectedEOF) {
+			// Preserve a completed read even at shutdown if the bounded queue
+			// still has room. Never wait for a receiver after cancellation.
+			m := message[T]{v, e}
+			select {
+			case s.records <- m:
+				continue
+			default:
+			}
+			select {
+			case s.records <- m:
+			case <-ctx.Done():
+				select {
+				case s.records <- m:
+				default:
+					s.discarded = true
+				}
 				return
 			}
 		}
 	})
-	return ch
+	return s
 }
 
 // Capture subscribes before inventory and consumes both streams concurrently.
@@ -81,7 +106,7 @@ func Capture(parent context.Context, c CaptureConfig, docker Docker, runtime Run
 		snapshot: correlate.Capture{Version: "runtime-capture/v1", CaptureID: c.ID, HostID: c.HostID, BootID: c.BootID, Window: evidence.ObservationWindow{From: start, Until: start}, Containers: []correlate.Container{}, Events: []correlate.Event{}, Gaps: []evidence.Gap{}, Diagnostics: []correlate.Diagnostic{}},
 		counts:   map[string]uint64{}, gaps: map[evidence.GapCode]bool{}, usedBytes: 4096,
 	}
-	if c.Duration <= 0 || c.Duration > time.Hour || c.InventoryInterval <= 0 || c.MaxBytes < 4096 || c.MaxBytes > 1<<30 || c.MaxRecords <= 0 || artifact.ValidateID(c.ID) != nil || s.snapshot.Validate() != nil {
+	if c.Duration <= 0 || c.Duration > time.Hour || c.InventoryInterval <= 0 || c.MaxBytes < 4096 || c.MaxBytes > acquire.MaxObjectBytes || c.MaxRecords <= 0 || artifact.ValidateID(c.ID) != nil || s.snapshot.Validate() != nil {
 		return s.snapshot, errors.New("invalid capture configuration")
 	}
 	ctx, cancel := context.WithTimeout(parent, c.Duration)
@@ -93,10 +118,29 @@ func Capture(parent context.Context, c CaptureConfig, docker Docker, runtime Run
 		return s.snapshot, errors.New("Docker subscription unavailable")
 	}
 	var wg sync.WaitGroup
-	defer func() { cancel(); _ = lifecycle.Close(); _ = runtime.Close(); wg.Wait() }()
+	shutdown := sync.OnceFunc(func() {
+		cancel()
+		_ = lifecycle.Close()
+		_ = runtime.Close()
+		wg.Wait()
+	})
+	defer shutdown()
 	containers := pump(ctx, &wg, lifecycle.Next)
 	events := pump(ctx, &wg, runtime.Next)
-	terminal := s.observe(ctx, docker, containers, events, &wg)
+	inventories := make(chan message[[]correlate.Container], 1)
+	s.observe(ctx, docker, containers.records, events.records, inventories, &wg)
+	s.snapshot.Window.Until = time.Now().UTC()
+	shutdown()
+	s.drain(ctx, docker, containers.records, events.records, inventories)
+	s.recordTerminal(containers.premature, "DOCKER_STREAM_ENDED")
+	s.recordTerminal(events.premature, "TETRAGON_STREAM_ENDED")
+	if containers.discarded || events.discarded {
+		s.interrupt("CAPTURE_QUEUE_DISCARDED")
+	}
+	var terminal error
+	if containers.premature != nil || events.premature != nil {
+		terminal = errors.New("capture stream ended prematurely")
+	}
 	return s.finish(parent, terminal)
 }
 
@@ -110,18 +154,17 @@ type captureState struct {
 	usedBytes int64
 	records   int
 	ready     bool
+	limit     bool
 }
 
 // observe serializes evidence updates and permits only one outstanding inventory
 // request. Cancellation and reader joining remain owned by Capture.
-func (s *captureState) observe(ctx context.Context, docker Docker, containers <-chan message[correlate.Container], events <-chan message[correlate.Event], wg *sync.WaitGroup) error {
-	inventories := make(chan message[[]correlate.Container], 1)
+func (s *captureState) observe(ctx context.Context, docker Docker, containers <-chan message[correlate.Container], events <-chan message[correlate.Event], inventories chan message[[]correlate.Container], wg *sync.WaitGroup) {
 	query := func() {
 		wg.Go(func() {
 			v, err := docker.Inventory(ctx)
-			select {
-			case inventories <- message[[]correlate.Container]{v, err}:
-			case <-ctx.Done():
+			if err == nil || ctx.Err() == nil {
+				inventories <- message[[]correlate.Container]{v, err}
 			}
 		})
 	}
@@ -129,28 +172,22 @@ func (s *captureState) observe(ctx context.Context, docker Docker, containers <-
 	inventoryPending := true
 	ticker := time.NewTicker(s.config.InventoryInterval)
 	defer ticker.Stop()
-	for {
+	for ctx.Err() == nil {
 		select {
 		case <-ctx.Done():
-			return nil
+			return
 		case m, ok := <-containers:
-			if ended(m, ok) {
-				return s.streamEnded(ctx, "Docker stream ended")
-			}
-			if !s.container(ctx, docker, m) {
-				return nil
+			if !ok || !s.container(ctx, docker, m) {
+				return
 			}
 		case m, ok := <-events:
-			if ended(m, ok) {
-				return s.streamEnded(ctx, "tetragon stream ended")
-			}
-			if !s.event(m) {
-				return nil
+			if !ok || !s.event(m, ctx.Err() == nil) {
+				return
 			}
 		case m := <-inventories:
 			inventoryPending = false
 			if !s.inventory(m) {
-				return nil
+				return
 			}
 		case <-ticker.C:
 			if !inventoryPending {
@@ -161,17 +198,55 @@ func (s *captureState) observe(ctx context.Context, docker Docker, containers <-
 	}
 }
 
-func ended[T any](m message[T], ok bool) bool {
-	return !ok || errors.Is(m.err, io.EOF) || errors.Is(m.err, io.ErrUnexpectedEOF)
+// The producers have joined. Drain only already received observations and
+// never start new I/O or advertise readiness once that window has ended.
+func (s *captureState) drain(ctx context.Context, docker Docker, containers <-chan message[correlate.Container], events <-chan message[correlate.Event], inventories <-chan message[[]correlate.Container]) {
+	for !s.limit && (containers != nil || events != nil) {
+		select {
+		case m, ok := <-containers:
+			if ok {
+				s.container(ctx, docker, m)
+			} else {
+				containers = nil
+			}
+		case m, ok := <-events:
+			if ok {
+				s.event(m, false)
+			} else {
+				events = nil
+			}
+		}
+	}
+	if !s.limit {
+		select {
+		case m := <-inventories:
+			s.inventory(m)
+		default:
+		}
+	}
+	if s.limit && (len(containers) > 0 || len(events) > 0 || len(inventories) > 0) {
+		s.interrupt("CAPTURE_QUEUE_DISCARDED")
+	}
 }
 
-func (s *captureState) streamEnded(ctx context.Context, reason string) error {
-	if ctx.Err() != nil {
-		return nil
+func isTerminal(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, ErrStreamRead)
+}
+
+func (s *captureState) recordTerminal(err error, code string) {
+	if err == nil {
+		return
 	}
+	s.interrupt(code)
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		s.gaps[evidence.TruncatedRecord] = true
+	}
+}
+
+func (s *captureState) interrupt(code string) {
 	s.snapshot.Interrupted = true
 	s.gaps[evidence.ObservationInterrupted] = true
-	return errors.New(reason)
+	s.counts[code]++
 }
 
 // accept charges valid records and failed reads to the same work budget. Only
@@ -179,12 +254,11 @@ func (s *captureState) streamEnded(ctx context.Context, reason string) error {
 func (s *captureState) accept(v any, recordReceived bool) bool {
 	b, err := json.Marshal(v)
 	if err != nil || s.usedBytes+int64(len(b))+1 > s.config.MaxBytes || s.records >= s.config.MaxRecords {
-		s.snapshot.Interrupted = true
+		s.limit = true
 		if recordReceived {
 			s.snapshot.Dropped++
 		}
-		s.gaps[evidence.ObservationInterrupted] = true
-		s.counts["CAPTURE_LIMIT"]++
+		s.interrupt("CAPTURE_LIMIT")
 		return false
 	}
 	s.usedBytes += int64(len(b)) + 1
@@ -212,6 +286,11 @@ func (s *captureState) container(ctx context.Context, docker Docker, m message[c
 	s.snapshot.Containers = append(s.snapshot.Containers, m.value)
 	switch m.value.Action {
 	case "create", "start", "die", "restart":
+		if ctx.Err() != nil {
+			s.gaps[evidence.ScopeMetadataUnavailable] = true
+			s.counts["INSPECT_UNAVAILABLE"]++
+			return true
+		}
 		o, err := docker.Inspect(ctx, m.value.ID)
 		if err != nil {
 			s.gaps[evidence.ScopeMetadataUnavailable] = true
@@ -226,7 +305,7 @@ func (s *captureState) container(ctx context.Context, docker Docker, m message[c
 	return true
 }
 
-func (s *captureState) event(m message[correlate.Event]) bool {
+func (s *captureState) event(m message[correlate.Event], notify bool) bool {
 	if m.err != nil {
 		return s.readFailure("TETRAGON_RECORD_ERROR")
 	}
@@ -236,7 +315,7 @@ func (s *captureState) event(m message[correlate.Event]) bool {
 	s.snapshot.Events = append(s.snapshot.Events, m.value)
 	if !s.ready && m.value.Kind != correlate.Unsupported && m.value.Kind != correlate.SourceLoss {
 		s.ready = true
-		if s.config.Ready != nil {
+		if notify && s.config.Ready != nil {
 			s.config.Ready()
 		}
 	}
@@ -259,7 +338,6 @@ func (s *captureState) inventory(m message[[]correlate.Container]) bool {
 }
 
 func (s *captureState) finish(parent context.Context, terminal error) (correlate.Capture, error) {
-	s.snapshot.Window.Until = time.Now().UTC()
 	// EOF may win select concurrently with parent cancellation. It cannot turn
 	// a cancelled observation window into success.
 	if err := parent.Err(); err != nil {

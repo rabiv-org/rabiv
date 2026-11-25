@@ -3,6 +3,7 @@ package correlate
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -236,5 +237,83 @@ func TestMissingProcessAndParentMetadataRemainExplicit(t *testing.T) {
 	}
 	if absent != 1 {
 		t.Fatalf("missing parent was conflated with missing child exec: count=%d", absent)
+	}
+}
+
+func TestUnassociatedEpochStillCompetes(t *testing.T) {
+	for _, tc := range []struct {
+		name                    string
+		closeOld, contradictNew bool
+		want                    string
+	}{
+		{"old_open", false, false, "AMBIGUOUS"},
+		{"old_closed", true, false, "UNRESOLVED"},
+		{"contradictory_new", false, true, "AMBIGUOUS"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := fixtureCapture()
+			start := c.Window.From
+			id := strings.Repeat("d", 64)
+			end := time.Time{}
+			if tc.closeOld {
+				end = start.Add(time.Second)
+			}
+			next := observation(id, "99", start.Add(2*time.Second), time.Time{})
+			c.Containers = []Container{observation(id, "12", start, end), next}
+			if tc.contradictNew {
+				next.JobID = "12"
+				c.Containers = append(c.Containers, next)
+			}
+			c.Events = []Event{{Kind: ProcessExec, Source: "TETRAGON", At: start.Add(3 * time.Second), ExecID: "later", ContainerID: id[:12]}}
+			r, err := Resolve(c, []build.Context{target("12")})
+			if err != nil || len(r.Scopes) != 1 || r.Events[0].Resolution != tc.want || r.Events[0].JobID != "" {
+				t.Fatalf("unexpected attribution: %+v, %v", r, err)
+			}
+		})
+	}
+}
+
+func TestContradictoryUnresolvedParentContainers(t *testing.T) {
+	c := fixtureCapture()
+	at := c.Window.From
+	c.Events = []Event{
+		{Kind: ProcessExec, Source: "TETRAGON", At: at, ExecID: "parent", ContainerID: "abc"},
+		{Kind: ProcessExec, Source: "TETRAGON", At: at, ExecID: "parent", ContainerID: "def"},
+		{Kind: ProcessExec, Source: "TETRAGON", At: at.Add(time.Second), ExecID: "child", ParentExecID: "parent", ContainerID: "cde"},
+	}
+	r, err := Resolve(c, []build.Context{target("12")})
+	if err != nil || r.Events[2].ParentObserved {
+		t.Fatalf("linked contradictory parent: %+v, %v", r, err)
+	}
+	// An observed parent need not share the child's container.
+	c.Events = c.Events[1:]
+	r, err = Resolve(c, []build.Context{target("12")})
+	if err != nil || !r.Events[1].ParentObserved {
+		t.Fatalf("lost cross-container parent: %+v, %v", r, err)
+	}
+}
+
+func BenchmarkResolve(b *testing.B) {
+	for _, tc := range []struct {
+		name               string
+		containers, events int
+	}{{"representative", 128, 10000}, {"high", 4096, 90000}} {
+		b.Run(tc.name, func(b *testing.B) {
+			c := fixtureCapture()
+			for i := range tc.containers {
+				c.Containers = append(c.Containers, observation(fmt.Sprintf("%016x%048x", i, i), "12", c.Window.From, c.Window.Until))
+			}
+			for i := range tc.events {
+				c.Events = append(c.Events, Event{Kind: ProcessExec, At: c.Window.From.Add(time.Second), Source: "TETRAGON", ContainerID: c.Containers[i%tc.containers].ID[:16], ExecID: fmt.Sprintf("exec-%d", i)})
+			}
+			targets := []build.Context{target("12")}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				if _, err := Resolve(c, targets); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

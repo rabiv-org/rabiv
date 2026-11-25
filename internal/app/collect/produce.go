@@ -1,10 +1,12 @@
 package collect
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"time"
 
 	v1 "github.com/rabiv-org/rabiv/contracts/v1"
@@ -43,6 +45,9 @@ func Produce(ctx context.Context, source acquire.Source, sink acquire.Sink, capt
 		}
 		return sink.Put(ctx, id, bytes.NewReader(b), 1<<20)
 	}
+	if maxCapture <= 0 || maxCapture > acquire.MaxObjectBytes {
+		return zero, errors.New("invalid capture byte limit")
+	}
 	b, err := source.Get(ctx, captureRef, maxCapture)
 	if err != nil {
 		return zero, err
@@ -55,16 +60,7 @@ func Produce(ctx context.Context, source acquire.Source, sink acquire.Sink, capt
 	if err != nil {
 		return zero, err
 	}
-	object := struct {
-		Version    string                   `json:"version"`
-		CaptureRef artifact.ObjectReference `json:"capture_ref"`
-		Result     correlate.Result         `json:"result"`
-	}{"runtime-evidence/v1", captureRef, r}
-	encoded, err := json.Marshal(object)
-	if err != nil {
-		return zero, err
-	}
-	ref, err := sink.Put(ctx, id+".evidence", bytes.NewReader(encoded), maxCapture+1<<20)
+	ref, err := putEvidence(ctx, sink, id+".evidence", captureRef, r)
 	if err != nil {
 		return zero, err
 	}
@@ -110,7 +106,7 @@ func Produce(ctx context.Context, source acquire.Source, sink acquire.Sink, capt
 	if err = m.Validate(); err != nil {
 		return zero, err
 	}
-	encoded, err = json.Marshal(m)
+	encoded, err := json.Marshal(m)
 	if err != nil {
 		return zero, err
 	}
@@ -118,4 +114,77 @@ func Produce(ctx context.Context, source acquire.Source, sink acquire.Sink, capt
 		return zero, err
 	}
 	return sink.Put(ctx, id, bytes.NewReader(encoded), 1<<20)
+}
+
+// Correlation adds per-record fields and may repeat build/scope metadata, so
+// capture size is not a reliable output limit. A separate object budget counts
+// actual encoded bytes at Put, without buffering the entire expanded JSON.
+func putEvidence(ctx context.Context, sink acquire.Sink, id string, ref artifact.ObjectReference, r correlate.Result) (artifact.ObjectReference, error) {
+	pr, pw := io.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w := bufio.NewWriter(pw)
+		err := encodeEvidence(ctx, w, ref, r)
+		if err == nil {
+			err = w.Flush()
+		}
+		_ = pw.CloseWithError(err)
+	}()
+	result, err := sink.Put(ctx, id, pr, acquire.MaxObjectBytes)
+	_ = pr.Close()
+	<-done
+	return result, err
+}
+
+func encodeEvidence(ctx context.Context, w io.Writer, ref artifact.ObjectReference, r correlate.Result) error {
+	if _, err := io.WriteString(w, `{"version":"runtime-evidence/v1","capture_ref":`); err != nil {
+		return err
+	}
+	if err := writeJSON(w, ref); err != nil {
+		return err
+	}
+	if err := encodeRows(ctx, w, `,"result":{"scopes":[`, r.Scopes); err != nil {
+		return err
+	}
+	if err := encodeRows(ctx, w, `],"events":[`, r.Events); err != nil {
+		return err
+	}
+	if err := encodeRows(ctx, w, `],"gaps":[`, r.Gaps); err != nil {
+		return err
+	}
+	if err := encodeRows(ctx, w, `],"diagnostics":[`, r.Diagnostics); err != nil {
+		return err
+	}
+	_, err := io.WriteString(w, `]}}`)
+	return err
+}
+
+func encodeRows[T any](ctx context.Context, w io.Writer, prefix string, rows []T) error {
+	if _, err := io.WriteString(w, prefix); err != nil {
+		return err
+	}
+	for i, row := range rows {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if i > 0 {
+			if _, err := io.WriteString(w, ","); err != nil {
+				return err
+			}
+		}
+		if err := writeJSON(w, row); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeJSON(w io.Writer, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(data)
+	return err
 }

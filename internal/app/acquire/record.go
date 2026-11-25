@@ -114,9 +114,12 @@ func Hash(data []byte) artifact.Digest {
 	return artifact.Digest{Algorithm: "sha256", Value: hex.EncodeToString(h[:])}
 }
 
+// MaxObjectBytes is the Phase 3 input store's per-object ceiling.
+const MaxObjectBytes int64 = 1 << 30
+
 // ReadLimit bounds bytes even when a peer lies about its content length.
 func ReadLimit(r io.Reader, limit int64) ([]byte, error) {
-	if limit <= 0 || limit > 1<<30 {
+	if limit <= 0 || limit > MaxObjectBytes {
 		return nil, errors.New("invalid byte limit")
 	}
 	b, err := io.ReadAll(io.LimitReader(r, limit+1))

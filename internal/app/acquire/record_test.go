@@ -37,7 +37,20 @@ func TestJobFailuresAndStrictHandoff(t *testing.T) {
 	ref := artifact.ObjectReference{ID: "archive", Digest: Hash([]byte("archive"))}
 	j.Archive = &ref
 	if j.Validate() == nil {
-		t.Fatal("accepted contradictory archive/failure")
+		t.Fatal("accepted archive on metadata-only record")
+	}
+	j.ArtifactsRequested = true
+	j.Build.PipelineID = "13"
+	j.Build.Source = &build.SourceRevision{RepositoryURI: "https://ci.example/team/project", CommitSHA: strings.Repeat("a", 40)}
+	j.Metadata = &artifact.ObjectReference{ID: "metadata", Digest: Hash([]byte("metadata"))}
+	failure := j.Failure
+	j.Failure = nil
+	if err := j.Validate(); err != nil {
+		t.Fatalf("test archive baseline is invalid: %v", err)
+	}
+	j.Failure = failure
+	if j.Validate() == nil {
+		t.Fatal("accepted an archive with a contradictory producer failure")
 	}
 	for _, raw := range [][]byte{bytes.Replace(b, []byte(`"version"`), []byte(`"Version"`), 1), bytes.Replace(b, []byte(`"failure":`), []byte(`"unknown":`), 1), append(b, []byte(`{}`)...)} {
 		if _, err := DecodeJob(raw); err == nil {

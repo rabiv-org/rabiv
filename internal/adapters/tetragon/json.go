@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rabiv-org/rabiv/internal/app/collect"
 	"github.com/rabiv-org/rabiv/internal/app/correlate"
 	"github.com/rabiv-org/rabiv/internal/domain/build"
 	"github.com/rabiv-org/rabiv/internal/platform/jsoninput"
@@ -38,8 +39,8 @@ func NewStream(r io.ReadCloser, maxRecord int64) (*Stream, error) {
 func (s *Stream) Close() error { return s.reader.Close() }
 func (s *Stream) Next() (correlate.Event, error) {
 	if !s.scanner.Scan() {
-		if s.scanner.Err() != nil {
-			return correlate.Event{}, io.ErrUnexpectedEOF
+		if err := s.scanner.Err(); err != nil {
+			return correlate.Event{}, errors.Join(collect.ErrStreamRead, err)
 		}
 		return correlate.Event{}, io.EOF
 	}
@@ -53,20 +54,20 @@ type process struct {
 	Docker string `json:"docker"`
 }
 type event struct {
-	Process  process `json:"process"`
-	Parent   process `json:"parent"`
-	Function string  `json:"function_name"`
-	Args     []struct {
-		File *struct {
-			Path string `json:"path"`
-		} `json:"file_arg"`
-		Int  *int64 `json:"int_arg"`
-		Sock *struct {
-			Address  string `json:"daddr"`
-			Port     uint16 `json:"dport"`
-			Protocol string `json:"protocol"`
-		} `json:"sock_arg"`
-	} `json:"args"`
+	Process  process                      `json:"process"`
+	Parent   process                      `json:"parent"`
+	Function string                       `json:"function_name"`
+	Args     []map[string]json.RawMessage `json:"args"`
+}
+
+func probeArg(args map[string]json.RawMessage, kind string, out any) bool {
+	for name, value := range args {
+		if name != kind && strings.HasSuffix(name, "_arg") && string(value) != "null" {
+			return false
+		}
+	}
+	value := args[kind]
+	return string(value) != "null" && jsoninput.Decode(value, out, false) == nil
 }
 
 // Normalize supports process_exec/exit and the explicit security_file_permission
@@ -103,7 +104,7 @@ func Normalize(data []byte, maxRecord int64) (correlate.Event, error) {
 		var loss struct {
 			Count json.Number `json:"number_of_dropped_process_events"`
 		}
-		if json.Unmarshal(raw[selected], &loss) != nil {
+		if jsoninput.Decode(raw[selected], &loss, false) != nil {
 			return zero, ErrRecord
 		}
 		count, e := strconv.ParseUint(string(loss.Count), 10, 64)
@@ -118,7 +119,7 @@ func Normalize(data []byte, maxRecord int64) (correlate.Event, error) {
 		return result, nil
 	}
 	var e event
-	if json.Unmarshal(raw[selected], &e) != nil {
+	if jsoninput.Decode(raw[selected], &e, false) != nil {
 		return zero, ErrRecord
 	}
 	result.ContainerID = e.Process.Docker
@@ -129,6 +130,9 @@ func Normalize(data []byte, maxRecord int64) (correlate.Event, error) {
 	if result.ContainerID != "" && (build.ObservedContainerID{Runtime: "DOCKER", Value: result.ContainerID}).Validate() != nil {
 		return zero, ErrRecord
 	}
+	if result.ExecID == "" || len(result.ExecID) > correlate.MaxExecIDBytes || len(result.ParentExecID) > correlate.MaxExecIDBytes {
+		return zero, ErrRecord
+	}
 	switch selected {
 	case "process_exec":
 		result.Kind = correlate.ProcessExec
@@ -137,30 +141,36 @@ func Normalize(data []byte, maxRecord int64) (correlate.Event, error) {
 	case "process_kprobe":
 		switch e.Function {
 		case "security_file_permission":
-			if len(e.Args) != 2 || e.Args[0].File == nil || e.Args[1].Int == nil || *e.Args[1].Int < 0 || *e.Args[1].Int > 1<<32-1 {
+			var file struct {
+				Path string `json:"path"`
+			}
+			var mask int64
+			if len(e.Args) != 2 || !probeArg(e.Args[0], "file_arg", &file) || !probeArg(e.Args[1], "int_arg", &mask) || mask < 0 || mask > 1<<32-1 {
 				return zero, ErrRecord
 			}
-			if *e.Args[1].Int&2 == 0 {
+			if mask&2 == 0 {
 				return result, nil
 			}
 			result.Kind = correlate.FileWriteIntent
-			result.FilePath = e.Args[0].File.Path
-			result.WriteMask = uint32(*e.Args[1].Int)
+			result.FilePath = file.Path
+			result.WriteMask = uint32(mask)
 		case "tcp_connect":
-			if len(e.Args) != 1 || e.Args[0].Sock == nil || e.Args[0].Sock.Protocol != "IPPROTO_TCP" {
+			var sock struct {
+				Address  string `json:"daddr"`
+				Port     uint16 `json:"dport"`
+				Protocol string `json:"protocol"`
+			}
+			if len(e.Args) != 1 || !probeArg(e.Args[0], "sock_arg", &sock) || sock.Protocol != "IPPROTO_TCP" {
 				return zero, ErrRecord
 			}
-			addr, err := netip.ParseAddr(e.Args[0].Sock.Address)
-			if err != nil || e.Args[0].Sock.Port == 0 {
+			addr, err := netip.ParseAddr(sock.Address)
+			if err != nil || sock.Port == 0 {
 				return zero, ErrRecord
 			}
 			result.Kind = correlate.TCPConnect
 			result.DestinationAddress = addr.String()
-			result.DestinationPort = e.Args[0].Sock.Port
+			result.DestinationPort = sock.Port
 		}
-	}
-	if result.ExecID == "" || len(result.ExecID) > 1024 {
-		return zero, ErrRecord
 	}
 	return result, nil
 }

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -60,7 +61,7 @@ func scopeID(c Capture, o Container) string {
 // next start, discovery time, Docker event time, or RestartCount. ExecID links
 // processes only within this host/boot snapshot; PIDs never supply identity.
 func Resolve(c Capture, targets []build.Context) (Result, error) {
-	r := Result{Scopes: []Scope{}, Events: []AttributedEvent{}, Gaps: []evidence.Gap{}, Diagnostics: []Diagnostic{}}
+	r := Result{Scopes: []Scope{}, Events: make([]AttributedEvent, 0, len(c.Events)), Gaps: []evidence.Gap{}, Diagnostics: []Diagnostic{}}
 	if c.Validate() != nil || len(targets) == 0 {
 		return r, errors.New("invalid correlation inputs")
 	}
@@ -81,13 +82,17 @@ func Resolve(c Capture, targets []build.Context) (Result, error) {
 	if c.Interrupted {
 		notes.gaps[evidence.ObservationInterrupted] = true
 	}
-	scopes, knownIDs, err := resolveScopes(c, targets, &notes)
+	if c.Dropped > 0 {
+		notes.gaps[evidence.ObservationInterrupted] = true
+		notes.counts["LOCAL_CAPTURE_DROPPED_RECORDS"] = c.Dropped
+	}
+	scopes, index, err := resolveScopes(c, targets, &notes)
 	if err != nil {
 		return r, err
 	}
 	r.Scopes = scopes
 	for _, e := range c.Events {
-		a := resolveEvent(e, scopes, knownIDs, &notes)
+		a := resolveEvent(e, index, &notes)
 		r.Events = append(r.Events, a)
 		if e.Kind != SourceLoss {
 			notes.counts[a.Resolution]++
@@ -119,33 +124,9 @@ func (n *correlationNotes) summarize(r *Result) {
 	sort.Slice(r.Diagnostics, func(i, j int) bool { return r.Diagnostics[i].Code < r.Diagnostics[j].Code })
 }
 
-// mergeEpochClaims enriches only the same full ID and actual start timestamp.
-// It never borrows labels from a different execution epoch.
-func mergeEpochClaims(c Capture) (map[string]Container, map[string]bool) {
-	claims := map[string]Container{}
-	blocked := map[string]bool{}
-	for _, o := range c.Containers {
-		if o.StartedAt == nil {
-			continue
-		}
-		key := scopeID(c, o)
-		previous, exists := claims[key]
-		if !exists {
-			claims[key] = o
-			continue
-		}
-		merged, conflict := mergeLabels(previous, o)
-		claims[key] = merged
-		if conflict {
-			blocked[key] = true
-		}
-	}
-	return claims, blocked
-}
-
-func mergeLabels(previous, observed Container) (Container, bool) {
+func mergeLabels(previous *Container, observed Container) bool {
 	conflict := false
-	for _, pair := range [][2]*string{{&previous.JobID, &observed.JobID}, {&previous.ProjectID, &observed.ProjectID}, {&previous.PipelineID, &observed.PipelineID}, {&previous.CommitSHA, &observed.CommitSHA}, {&previous.RawRole, &observed.RawRole}} {
+	for _, pair := range [][2]*string{{&previous.JobID, &observed.JobID}, {&previous.ProjectID, &observed.ProjectID}, {&previous.PipelineID, &observed.PipelineID}, {&previous.CommitSHA, &observed.CommitSHA}, {&previous.RawRole, &observed.RawRole}, {&previous.RunnerSystemID, &observed.RunnerSystemID}} {
 		if *pair[0] != "" && *pair[1] != "" && *pair[0] != *pair[1] {
 			conflict = true
 		}
@@ -153,52 +134,117 @@ func mergeLabels(previous, observed Container) (Container, bool) {
 			*pair[0] = *pair[1]
 		}
 	}
-	return previous, conflict
+	return conflict
 }
 
-type scopeCandidate struct {
-	scope   Scope
-	invalid bool
+type epoch struct {
+	claim         Container
+	contradictory bool
+	scope         *Scope
 }
 
-func resolveScopes(c Capture, targets []build.Context, notes *correlationNotes) ([]Scope, map[string]bool, error) {
-	claims, blocked := mergeEpochClaims(c)
-	knownIDs := map[string]bool{}
-	candidates := map[string]*scopeCandidate{}
+// Merge claims only for the same full ID and actual start, retaining even
+// unassociated or contradictory epochs as possible competing observations.
+func collectEpochs(c Capture, notes *correlationNotes) map[string]map[time.Time]*epoch {
+	byID := map[string]map[time.Time]*epoch{}
 	for _, o := range c.Containers {
-		knownIDs[o.ID] = true
+		claims := byID[o.ID]
+		if claims == nil {
+			claims = map[time.Time]*epoch{}
+			byID[o.ID] = claims
+		}
 		if o.StartedAt == nil {
 			notes.gaps[evidence.ScopeMetadataUnavailable] = true
 			notes.counts["RUNTIME_START_UNAVAILABLE"]++
 			continue
 		}
-		key := scopeID(c, o)
-		if blocked[key] {
-			notes.gaps[evidence.AmbiguousScope] = true
-			notes.counts["CONTRADICTORY_SCOPE_METADATA"]++
+		start := o.StartedAt.UTC()
+		e := claims[start]
+		if e == nil {
+			claims[start] = &epoch{claim: o}
 			continue
 		}
-		known := claims[key]
-		o.JobID, o.ProjectID = known.JobID, known.ProjectID
-		o.PipelineID, o.CommitSHA, o.RawRole = known.PipelineID, known.CommitSHA, known.RawRole
-		target, ok := associateBuild(o, targets, notes)
-		if !ok {
-			continue
+		e.contradictory = mergeLabels(&e.claim, o) || e.contradictory
+		if o.FinishedAt != nil {
+			end := e.claim.FinishedAt
+			e.contradictory = e.contradictory || end != nil && !end.Equal(*o.FinishedAt)
+			// Compete through the latest claimed end if end claims conflict.
+			if end == nil || end.Before(*o.FinishedAt) {
+				e.claim.FinishedAt = o.FinishedAt
+			}
 		}
-		value := Scope{Build: target.Identity, Execution: build.ExecutionScope{ScopeID: key, HostID: c.HostID, BootID: c.BootID, Container: build.ContainerIdentity{Runtime: "DOCKER", CanonicalID: o.ID}, Role: role(o.RawRole), RawRole: o.RawRole, StartedAt: *o.StartedAt, EndedAt: o.FinishedAt}}
-		if value.Execution.Validate() != nil {
-			return nil, nil, errors.New("invalid execution scope")
-		}
-		mergeScope(candidates, value, notes)
 	}
+	return byID
+}
+
+type epochIndex struct {
+	ids    []string
+	series map[string][]epochBoundary
+}
+
+// For starts up to a given time, the two latest ends suffice to distinguish
+// zero, one or multiple competing epochs. An unknown end remains open.
+type epochBoundary struct {
+	start          time.Time
+	latest, second *epoch
+}
+
+func endsLater(a, b *epoch) bool {
+	return b == nil || b.claim.FinishedAt != nil && (a.claim.FinishedAt == nil || a.claim.FinishedAt.After(*b.claim.FinishedAt))
+}
+
+func active(e *epoch, at time.Time) bool {
+	return e != nil && (e.claim.FinishedAt == nil || !at.After(*e.claim.FinishedAt))
+}
+
+func indexEpochs(epochs []*epoch) []epochBoundary {
+	sort.Slice(epochs, func(i, j int) bool { return epochs[i].claim.StartedAt.Before(*epochs[j].claim.StartedAt) })
+	series := make([]epochBoundary, 0, len(epochs))
+	var row epochBoundary
+	for _, e := range epochs {
+		switch {
+		case endsLater(e, row.latest):
+			row.latest, row.second = e, row.latest
+		case endsLater(e, row.second):
+			row.second = e
+		}
+		row.start = *e.claim.StartedAt
+		series = append(series, row)
+	}
+	return series
+}
+
+func resolveScopes(c Capture, targets []build.Context, notes *correlationNotes) ([]Scope, epochIndex, error) {
+	claims := collectEpochs(c, notes)
+	index := epochIndex{ids: make([]string, 0, len(claims)), series: make(map[string][]epochBoundary, len(claims))}
 	scopes := []Scope{}
-	for _, candidate := range candidates {
-		if !candidate.invalid {
-			scopes = append(scopes, candidate.scope)
+	for id, observations := range claims {
+		index.ids = append(index.ids, id)
+		epochs := make([]*epoch, 0, len(observations))
+		for _, e := range observations {
+			epochs = append(epochs, e)
+			if e.contradictory {
+				notes.gaps[evidence.AmbiguousScope] = true
+				notes.counts["CONTRADICTORY_SCOPE_METADATA"]++
+				continue
+			}
+			o := e.claim
+			target, ok := associateBuild(o, targets, notes)
+			if !ok {
+				continue
+			}
+			value := Scope{Build: target.Identity, Execution: build.ExecutionScope{ScopeID: scopeID(c, o), HostID: c.HostID, BootID: c.BootID, Container: build.ContainerIdentity{Runtime: "DOCKER", CanonicalID: o.ID}, Role: role(o.RawRole), RawRole: o.RawRole, StartedAt: *o.StartedAt, EndedAt: o.FinishedAt}}
+			if value.Execution.Validate() != nil {
+				return nil, epochIndex{}, errors.New("invalid execution scope")
+			}
+			e.scope = &value
+			scopes = append(scopes, value)
 		}
+		index.series[id] = indexEpochs(epochs)
 	}
+	slices.Sort(index.ids)
 	sort.Slice(scopes, func(i, j int) bool { return scopes[i].Execution.ScopeID < scopes[j].Execution.ScopeID })
-	return scopes, knownIDs, nil
+	return scopes, index, nil
 }
 
 func associateBuild(o Container, targets []build.Context, notes *correlationNotes) (build.Context, bool) {
@@ -230,24 +276,7 @@ func associateBuild(o Container, targets []build.Context, notes *correlationNote
 	return t, true
 }
 
-func mergeScope(candidates map[string]*scopeCandidate, value Scope, notes *correlationNotes) {
-	id := value.Execution.ScopeID
-	previous, ok := candidates[id]
-	if !ok {
-		candidates[id] = &scopeCandidate{scope: value}
-		return
-	}
-	p, next := &previous.scope.Execution, value.Execution
-	if previous.scope.Build != value.Build || p.Role != next.Role || p.RawRole != next.RawRole || p.EndedAt != nil && next.EndedAt != nil && !p.EndedAt.Equal(*next.EndedAt) {
-		previous.invalid = true
-		notes.gaps[evidence.AmbiguousScope] = true
-		notes.counts["CONTRADICTORY_SCOPE_METADATA"]++
-	} else if p.EndedAt == nil {
-		p.EndedAt = next.EndedAt
-	}
-}
-
-func resolveEvent(e Event, scopes []Scope, knownIDs map[string]bool, notes *correlationNotes) AttributedEvent {
+func resolveEvent(e Event, index epochIndex, notes *correlationNotes) AttributedEvent {
 	if e.NativeKind == "process_throttle" {
 		notes.gaps[evidence.ObservationInterrupted] = true
 		notes.counts["THROTTLE_OBSERVED"]++
@@ -255,6 +284,9 @@ func resolveEvent(e Event, scopes []Scope, knownIDs map[string]bool, notes *corr
 	a := AttributedEvent{Event: e, Resolution: "UNRESOLVED"}
 	if e.Kind == SourceLoss {
 		a.Resolution = "SOURCE_REPORT"
+		if *e.LossCount > 0 {
+			notes.gaps[evidence.ObservationInterrupted] = true
+		}
 		return a
 	}
 	if e.ContainerID == "" {
@@ -262,34 +294,37 @@ func resolveEvent(e Event, scopes []Scope, knownIDs map[string]bool, notes *corr
 		notes.gaps[evidence.UnresolvedScope] = true
 		return a
 	}
-	fullIDs := 0
-	for id := range knownIDs {
-		if strings.HasPrefix(id, e.ContainerID) {
-			fullIDs++
-		}
-	}
-	if fullIDs > 1 {
-		a.Resolution = "AMBIGUOUS"
-		notes.gaps[evidence.AmbiguousScope] = true
-		return a
-	}
-	var matched []Scope
-	for _, s := range scopes {
-		x := s.Execution
-		if strings.HasPrefix(x.Container.CanonicalID, e.ContainerID) && !e.At.Before(x.StartedAt) && (x.EndedAt == nil || !e.At.After(*x.EndedAt)) {
-			matched = append(matched, s)
-		}
-	}
+	matched, ambiguous := index.match(e.ContainerID, e.At)
 	switch {
-	case len(matched) == 1 && fullIDs == 1:
-		a.Resolution, a.ScopeID, a.JobID = "MATCHED", matched[0].Execution.ScopeID, matched[0].Build.JobID
-	case len(matched) > 1:
+	case ambiguous:
 		a.Resolution = "AMBIGUOUS"
 		notes.gaps[evidence.AmbiguousScope] = true
+	case matched != nil:
+		a.Resolution, a.ScopeID, a.JobID = "MATCHED", matched.Execution.ScopeID, matched.Build.JobID
 	default:
 		notes.gaps[evidence.UnresolvedScope] = true
 	}
 	return a
+}
+
+func (index epochIndex) match(prefix string, at time.Time) (*Scope, bool) {
+	i := sort.SearchStrings(index.ids, prefix)
+	if i == len(index.ids) || !strings.HasPrefix(index.ids[i], prefix) {
+		return nil, false
+	}
+	if i+1 < len(index.ids) && strings.HasPrefix(index.ids[i+1], prefix) {
+		return nil, true
+	}
+	series := index.series[index.ids[i]]
+	n := sort.Search(len(series), func(i int) bool { return series[i].start.After(at) })
+	if n == 0 || !active(series[n-1].latest, at) {
+		return nil, false
+	}
+	row := series[n-1]
+	if active(row.second, at) || row.latest.contradictory {
+		return nil, true
+	}
+	return row.latest.scope, false
 }
 
 func linkProcesses(events []AttributedEvent, notes *correlationNotes) {
@@ -305,8 +340,12 @@ func linkProcesses(events []AttributedEvent, notes *correlationNotes) {
 			continue
 		}
 		p := events[previous]
-		if p.ScopeID != a.ScopeID || !p.Event.At.Equal(a.Event.At) {
+		prefix, observed := p.Event.ContainerID, a.Event.ContainerID
+		if p.ScopeID != a.ScopeID || !p.Event.At.Equal(a.Event.At) || !strings.HasPrefix(prefix, observed) && !strings.HasPrefix(observed, prefix) {
 			conflicts[a.Event.ExecID] = true
+		} else if len(observed) > len(prefix) {
+			// Keep the strongest constraint for later duplicate records.
+			processes[a.Event.ExecID] = i
 		}
 	}
 	for i := range events {

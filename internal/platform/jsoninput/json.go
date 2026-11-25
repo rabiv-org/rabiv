@@ -5,6 +5,7 @@ package jsoninput
 import (
 	"bytes"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"io"
 	"strconv"
@@ -18,7 +19,8 @@ var ErrInvalid = errors.New("invalid JSON input")
 
 // Decode rejects duplicate keys, invalid UTF-8/surrogates, excessive nesting and
 // trailing values. Closed intermediate records additionally forbid null, unknown
-// fields and noncanonical keys. Upstream records may have unknown fields/null.
+// fields and noncanonical keys. Upstream records match exact field names but
+// may have unknown fields/null.
 // Callers must bound data before calling Decode.
 func Decode(data []byte, out any, closed bool) error {
 	if !utf8.Valid(data) {
@@ -32,10 +34,16 @@ func Decode(data []byte, out any, closed bool) error {
 	if _, err := d.Token(); err != io.EOF {
 		return ErrInvalid
 	}
-	d = json.NewDecoder(bytes.NewReader(data))
-	if closed {
-		d.DisallowUnknownFields()
+	if !closed {
+		// Keep legacy value semantics (including json.Number), but never let a
+		// differently cased extension assign to a recognized metadata field.
+		if jsonv2.Unmarshal(data, out, json.DefaultOptionsV1(), jsonv2.MatchCaseInsensitiveNames(false)) != nil {
+			return ErrInvalid
+		}
+		return nil
 	}
+	d = json.NewDecoder(bytes.NewReader(data))
+	d.DisallowUnknownFields()
 	if d.Decode(out) != nil {
 		return ErrInvalid
 	}
