@@ -19,18 +19,8 @@ func Check(uid, gid int, allowed []int) error {
 		return ErrCredentials
 	}
 	groups, err := os.Getgroups()
-	if err != nil {
+	if err != nil || !validGroups(gid, groups, allowed) {
 		return ErrCredentials
-	}
-	for _, g := range groups {
-		if g != gid && !slices.Contains(allowed, g) {
-			return ErrCredentials
-		}
-	}
-	for _, g := range allowed {
-		if g <= 0 || !slices.Contains(groups, g) {
-			return ErrCredentials
-		}
 	}
 	b, err := os.ReadFile("/proc/self/status")
 	if err != nil {
@@ -75,4 +65,18 @@ func Check(uid, gid int, allowed []int) error {
 		}
 	}
 	return nil
+}
+
+func validGroups(primary int, actual, allowed []int) bool {
+	for _, g := range actual {
+		if g != primary && !slices.Contains(allowed, g) {
+			return false
+		}
+	}
+	for _, g := range allowed {
+		if g <= 0 || !slices.Contains(actual, g) {
+			return false
+		}
+	}
+	return true
 }

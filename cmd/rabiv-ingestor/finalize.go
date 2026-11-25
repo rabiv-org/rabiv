@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"io"
 	"time"
 
@@ -16,11 +17,11 @@ import (
 
 type finalizeOptions struct {
 	outputOptions
-	fetchChannel, workerChannel string
-	jobRef, workerRef           string
-	workflowID, groupID         string
-	maxArchive, maxSBOM         int64
-	subjects                    list
+	fetchChannel, workerChannel   string
+	jobRef, workerRef             string
+	workflowID, groupID           string
+	maxArchive, maxEntry, maxSBOM int64
+	subjects                      list
 }
 
 func parseFinalize(args []string) (finalizeOptions, error) {
@@ -32,11 +33,17 @@ func parseFinalize(args []string) (finalizeOptions, error) {
 	f.StringVar(&o.workerRef, "worker-ref", "", "worker snapshot id@sha256hex; absent becomes FAILED")
 	f.StringVar(&o.workflowID, "workflow-id", "", "explicit workflow ID")
 	f.StringVar(&o.groupID, "group-id", "", "explicit subject group ID")
-	f.Int64Var(&o.maxArchive, "max-archive", 32<<20, "transport/subject byte limit")
+	f.Int64Var(&o.maxArchive, "max-archive", 32<<20, "transport byte limit")
+	f.Int64Var(&o.maxEntry, "max-entry", 16<<20, "per expanded subject byte limit")
 	f.Int64Var(&o.maxSBOM, "max-sbom", 8<<20, "per SBOM byte limit")
 	f.Var(&o.subjects, "subject", "exact expected subject name, repeatable")
 	if f.Parse(args) != nil || f.NArg() != 0 {
 		return o, errors.New("invalid finalization arguments")
+	}
+	emptyRef := false
+	f.Visit(func(f *flag.Flag) { emptyRef = emptyRef || f.Name == "worker-ref" && o.workerRef == "" })
+	if emptyRef {
+		return o, errors.New("worker reference cannot be empty when supplied")
 	}
 	o.outputOptions = *output
 	return o, nil
@@ -92,7 +99,7 @@ func runFinalize(ctx context.Context, args []string, out io.Writer) error {
 		}
 		wr = &r
 	}
-	ref, e := ingest.Finalize(ctx, fetch, work, sink, ingest.FinalizeRequest{JobRef: job, WorkerRef: wr, ManifestID: o.id, WorkflowID: o.workflowID, GroupID: o.groupID, Subjects: o.subjects, At: time.Now().UTC(), MaxArchive: o.maxArchive, MaxSBOM: o.maxSBOM})
+	ref, e := ingest.Finalize(ctx, fetch, work, sink, ingest.FinalizeRequest{JobRef: job, WorkerRef: wr, ManifestID: o.id, WorkflowID: o.workflowID, GroupID: o.groupID, Subjects: o.subjects, At: time.Now().UTC(), MaxArchive: o.maxArchive, MaxEntry: o.maxEntry, MaxSBOM: o.maxSBOM})
 	if e != nil {
 		return e
 	}

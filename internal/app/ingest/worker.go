@@ -60,22 +60,45 @@ type SBOMBundle struct {
 // references/bytes/build bindings. A compromised worker can still poison its own
 // inputs; no provenance authenticity or security assessment is asserted here.
 type WorkerResult struct {
-	Version       string                    `json:"version"`
-	Build         build.Context             `json:"build"`
-	JobRef        artifact.ObjectReference  `json:"job_ref"`
-	Archive       artifact.ObjectReference  `json:"archive"`
-	Subjects      []SubjectObject           `json:"subjects"`
-	SBOMs         []SBOMObject              `json:"sboms"`
-	ProvenanceRaw *artifact.ObjectReference `json:"provenance_raw,omitempty"`
-	Provenance    *provenance.Reference     `json:"provenance,omitempty"`
-	ExistingSBOM  *artifact.ObjectReference `json:"existing_sbom,omitempty"`
-	Issues        []string                  `json:"issues"`
-	Failure       *v1.Failure               `json:"failure,omitempty"`
+	Version           string                    `json:"version"`
+	Build             build.Context             `json:"build"`
+	JobRef            artifact.ObjectReference  `json:"job_ref"`
+	Archive           artifact.ObjectReference  `json:"archive"`
+	RequestedSubjects []string                  `json:"requested_subjects"`
+	Subjects          []SubjectObject           `json:"subjects"`
+	SBOMs             []SBOMObject              `json:"sboms"`
+	ProvenanceRaw     *artifact.ObjectReference `json:"provenance_raw,omitempty"`
+	Provenance        *provenance.Reference     `json:"provenance,omitempty"`
+	ExistingSBOM      *artifact.ObjectReference `json:"existing_sbom,omitempty"`
+	Issues            []string                  `json:"issues"`
+	Failure           *v1.Failure               `json:"failure,omitempty"`
 }
 
+const workerResultVersion = "acquisition-worker/v2"
+
+func subjectSelection(names []string, digest artifact.Digest) (map[string]bool, error) {
+	if len(names) == 0 || len(names) > 128 {
+		return nil, errors.New("invalid subject selection")
+	}
+	seen := make(map[string]bool, len(names))
+	for _, name := range names {
+		if seen[name] || (artifact.Subject{Name: name, Digest: digest}).Validate() != nil {
+			return nil, errors.New("invalid subject selection")
+		}
+		seen[name] = true
+	}
+	return seen, nil
+}
+
+func validByteLimit(limit int64) bool { return limit > 0 && limit <= acquire.MaxObjectBytes }
+
 func (r WorkerResult) Validate() error {
-	if r.Version != acquire.Version || r.Build.ValidateComplete() != nil || r.JobRef.Validate() != nil || r.Archive.Validate() != nil || r.Subjects == nil || r.SBOMs == nil || r.Issues == nil {
+	if r.Version != workerResultVersion || r.Build.ValidateComplete() != nil || r.JobRef.Validate() != nil || r.Archive.Validate() != nil || r.Subjects == nil || r.SBOMs == nil || r.Issues == nil {
 		return errors.New("invalid worker result")
+	}
+	requested, err := subjectSelection(r.RequestedSubjects, r.JobRef.Digest)
+	if err != nil {
+		return err
 	}
 	for _, ref := range []*artifact.ObjectReference{r.ProvenanceRaw, r.ExistingSBOM} {
 		if ref != nil && ref.Validate() != nil {
@@ -92,22 +115,20 @@ func (r WorkerResult) Validate() error {
 			return errors.New("invalid acquisition issue code")
 		}
 	}
-	var subjects []artifact.Subject
+	subjects := make(map[string]artifact.Digest, len(r.Subjects))
 	for _, s := range r.Subjects {
-		if s.Reference.Validate() != nil || s.Reference.Digest != s.Subject.Digest {
+		_, duplicate := subjects[s.Subject.Name]
+		if s.Reference.Validate() != nil || s.Reference.Digest != s.Subject.Digest || !requested[s.Subject.Name] || duplicate {
 			return errors.New("subject reference mismatch")
 		}
-		subjects = append(subjects, s.Subject)
+		subjects[s.Subject.Name] = s.Subject.Digest
 	}
-	if len(subjects) > 0 && artifact.ValidateSubjects(subjects) != nil {
-		return errors.New("invalid partial subjects")
-	}
-	if r.Failure == nil && (len(subjects) == 0 || len(r.SBOMs) != len(subjects)) {
+	if r.Failure == nil && (len(subjects) != len(requested) || len(r.SBOMs) != len(subjects)) {
 		return errors.New("missing subjects or SBOMs")
 	}
 	seen := map[string]bool{}
 	for _, s := range r.SBOMs {
-		if s.Reference.Validate() != nil || s.Subject.Validate() != nil || seen[s.Subject.Name] || !artifact.ContainsSubjects(subjects, []artifact.Subject{s.Subject}) {
+		if s.Reference.Validate() != nil || s.Subject.Validate() != nil || seen[s.Subject.Name] || subjects[s.Subject.Name] != s.Subject.Digest {
 			return errors.New("invalid SBOM binding")
 		}
 		seen[s.Subject.Name] = true
@@ -129,19 +150,15 @@ func DecodeWorker(data []byte) (WorkerResult, error) {
 // Process runs only after OS isolation preflight in the composition root. No CI
 // client, token, socket or decision-storage writer is available through its ports.
 // Raw malformed provenance is stored before parsing and never silently repaired.
-func Process(ctx context.Context, fetch acquire.Source, out acquire.Sink, archive ArchiveReader, scanner Scanner, parser ProvenanceParser, jobRef artifact.ObjectReference, id string, names []string, maxArchive, maxSBOM int64) (artifact.ObjectReference, error) {
+func Process(ctx context.Context, fetch acquire.Source, out acquire.Sink, archive ArchiveReader, scanner Scanner, parser ProvenanceParser, jobRef artifact.ObjectReference, id string, names []string, maxArchive, maxEntry, maxSBOM int64) (artifact.ObjectReference, error) {
 	var zero artifact.ObjectReference
-	if artifact.ValidateID(id) != nil || jobRef.Validate() != nil || len(names) == 0 || len(names) > 128 || maxArchive <= 0 || maxArchive > 1<<30 || maxSBOM <= 0 || maxSBOM > 1<<30 {
+	if artifact.ValidateID(id) != nil || jobRef.Validate() != nil || !validByteLimit(maxArchive) || !validByteLimit(maxEntry) || !validByteLimit(maxSBOM) {
 		return zero, errors.New("invalid worker request")
 	}
 	// Reuse domain validation for exact logical names and duplicate selection.
 	// The already validated reference digest is only a syntax-validation input
 	// here. Actual subject digests are computed from selected bytes below.
-	selection := make([]artifact.Subject, 0, len(names))
-	for _, name := range names {
-		selection = append(selection, artifact.Subject{Name: name, Digest: jobRef.Digest})
-	}
-	if err := artifact.ValidateSubjects(selection); err != nil {
+	if _, err := subjectSelection(names, jobRef.Digest); err != nil {
 		return zero, errors.New("invalid worker subject selection")
 	}
 	b, err := fetch.Get(ctx, jobRef, 1<<20)
@@ -155,7 +172,7 @@ func Process(ctx context.Context, fetch acquire.Source, out acquire.Sink, archiv
 	if !job.ArtifactsRequested || job.Archive == nil || job.Failure != nil {
 		return zero, errors.New("fetched archive unavailable")
 	}
-	r := WorkerResult{Version: acquire.Version, Build: job.Build, JobRef: jobRef, Archive: *job.Archive, Subjects: []SubjectObject{}, SBOMs: []SBOMObject{}, Issues: []string{}}
+	r := WorkerResult{Version: workerResultVersion, Build: job.Build, JobRef: jobRef, Archive: *job.Archive, RequestedSubjects: slices.Clone(names), Subjects: []SubjectObject{}, SBOMs: []SBOMObject{}, Issues: []string{}}
 	finish := func() (artifact.ObjectReference, error) {
 		if e := r.Validate(); e != nil {
 			return zero, e
@@ -200,7 +217,7 @@ func Process(ctx context.Context, fetch acquire.Source, out acquire.Sink, archiv
 		r.Issues = append(r.Issues, "EXISTING_SBOM_UNVERIFIED")
 	}
 	for _, s := range contents.Subjects {
-		ref, e := put(s.Bytes, maxArchive)
+		ref, e := put(s.Bytes, maxEntry)
 		if e != nil {
 			return zero, e
 		}

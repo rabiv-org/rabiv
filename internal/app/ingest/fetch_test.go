@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	v1 "github.com/rabiv-org/rabiv/contracts/v1"
@@ -64,7 +65,7 @@ func TestFetchAcknowledgementContainsOnlyCommittedSnapshots(t *testing.T) {
 					sinks[i].failAt = tc.failAt
 				}
 			}
-			refs, err := FetchTo(context.Background(), fakeCI{id: id}, FetchChannels{Collector: sinks[0], Worker: sinks[1], Finalizer: sinks[2]}, tc.snapshot, id, time.Now().UTC(), 1024)
+			refs, err := FetchTo(context.Background(), fakeCI{id: id}, FetchChannels{Collector: sinks[0], Worker: sinks[1], Finalizer: sinks[2]}, tc.snapshot, id, time.Now().UTC(), 1024, time.Second)
 			if tc.want == 3 && err != nil || tc.want != 3 && err == nil {
 				t.Fatalf("unexpected result: %v", err)
 			}
@@ -110,6 +111,38 @@ func (f fakeCI) Job(context.Context, build.Identity) (build.Context, []byte, err
 }
 func (f fakeCI) Artifacts(context.Context, build.Identity) ([]byte, error) {
 	return []byte("opaque archive"), nil
+}
+
+type slowCI struct{ fakeCI }
+
+func (f slowCI) Job(ctx context.Context, id build.Identity) (build.Context, []byte, error) {
+	time.Sleep(600 * time.Millisecond)
+	return f.fakeCI.Job(ctx, id)
+}
+
+func (f slowCI) Artifacts(ctx context.Context, id build.Identity) ([]byte, error) {
+	select {
+	case <-time.After(600 * time.Millisecond):
+		return f.fakeCI.Artifacts(ctx, id)
+	case <-ctx.Done():
+		return nil, &acquire.InputError{Code: v1.InputUnavailable}
+	}
+}
+
+func TestFetchToSharesAcquisitionDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		id := build.Identity{Provider: build.GitLab, Instance: "https://ci.example", ProjectID: "8", JobID: "22"}
+		collector, work, final := &memory{}, &memory{}, &memory{}
+		start := time.Now().UTC()
+		refs, err := FetchTo(t.Context(), slowCI{fakeCI{id: id}}, FetchChannels{Collector: collector, Worker: work, Finalizer: final}, "fetch", id, start, 1024, time.Second)
+		if elapsed := time.Since(start); err != nil || elapsed != time.Second {
+			t.Fatalf("unexpected acquisition deadline or publication: %s %v", elapsed, err)
+		}
+		job, err := acquire.DecodeJob(final.data[refs.Finalizer.ID])
+		if err != nil || job.Failure == nil || job.Failure.Code != v1.InputUnavailable || job.Archive != nil {
+			t.Fatalf("timeout was not published as an unavailable archive: %+v %v", job, err)
+		}
+	})
 }
 
 func TestFetchSuccessAndFailure(t *testing.T) {

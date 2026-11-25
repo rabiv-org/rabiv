@@ -99,12 +99,14 @@ func Fetch(ctx context.Context, ci CI, sink acquire.Sink, id string, job build.I
 
 // FetchTo acquires once, then publishes to three least-privilege channels. No
 // archive is parsed and no worker inherits this process's API credential.
-func FetchTo(ctx context.Context, ci CI, out FetchChannels, id string, job build.Identity, at time.Time, maxArchive int64) (FetchRefs, error) {
+func FetchTo(ctx context.Context, ci CI, out FetchChannels, id string, job build.Identity, at time.Time, maxArchive int64, acquisitionTimeout time.Duration) (FetchRefs, error) {
 	var refs FetchRefs
-	if out.Collector == nil || out.Worker == nil || out.Finalizer == nil {
-		return refs, errors.New("three fetch channels required")
+	if out.Collector == nil || out.Worker == nil || out.Finalizer == nil || acquisitionTimeout <= 0 {
+		return refs, errors.New("three fetch channels and positive acquisition timeout required")
 	}
-	f, err := prepare(ctx, ci, id, job, at, maxArchive)
+	fetchCtx, cancel := context.WithTimeout(ctx, acquisitionTimeout)
+	f, err := prepare(fetchCtx, ci, id, job, at, maxArchive)
+	cancel() // The upstream deadline does not cancel a bounded publication.
 	if err != nil {
 		return refs, err
 	}

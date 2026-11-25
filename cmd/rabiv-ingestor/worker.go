@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"os"
-	"strings"
 	"time"
 
 	zipadapter "github.com/rabiv-org/rabiv/internal/adapters/archive"
@@ -22,6 +21,9 @@ import (
 func runWorkerLauncher(ctx context.Context, args []string, out io.Writer) error {
 	if len(args) < 2 || args[0] != "--profile" {
 		return errors.New("worker-run requires --profile PATH followed by worker arguments")
+	}
+	if _, err := parseWorkerWithProfile(args[2:], args[1]); err != nil {
+		return err
 	}
 	b, err := worker.Launch(ctx, args[1], args[2:])
 	if err != nil {
@@ -45,11 +47,6 @@ func readWorkerRequest(profile string, in io.Reader) ([]string, error) {
 	if jsoninput.Decode(b, &request, true) != nil {
 		return nil, errors.New("invalid worker request")
 	}
-	for _, a := range request {
-		if strings.TrimLeft(strings.SplitN(a, "=", 2)[0], "-") == "profile" || a == "--request-stdin" {
-			return nil, errors.New("worker profile override forbidden")
-		}
-	}
 	return request, nil
 }
 
@@ -62,9 +59,15 @@ type workerOptions struct {
 }
 
 func parseWorker(args []string) (workerOptions, error) {
+	return parseWorkerWithProfile(args, "")
+}
+
+func parseWorkerWithProfile(args []string, trustedProfile string) (workerOptions, error) {
 	f, output := commandFlags("worker")
-	var o workerOptions
-	f.StringVar(&o.profile, "profile", "", "root-owned isolation profile")
+	o := workerOptions{profile: trustedProfile}
+	if trustedProfile == "" {
+		f.StringVar(&o.profile, "profile", "", "root-owned isolation profile")
+	}
 	f.StringVar(&o.fetchChannel, "fetch-channel", "", "Worker's Fetch channel")
 	f.StringVar(&o.jobRef, "job-ref", "", "fetched snapshot id@sha256hex")
 	f.StringVar(&o.archive.ProvenanceEntry, "provenance-entry", "artifacts-metadata.json", "exact optional Runner ZIP entry")
@@ -84,14 +87,15 @@ func parseWorker(args []string) (workerOptions, error) {
 }
 
 func runWorker(ctx context.Context, args []string, out io.Writer) error {
+	profile := ""
 	if len(args) == 3 && args[0] == "--profile" && args[2] == "--request-stdin" {
 		request, err := readWorkerRequest(args[1], os.Stdin)
 		if err != nil {
 			return err
 		}
-		args = append([]string{"--profile", args[1]}, request...)
+		profile, args = args[1], request
 	}
-	o, e := parseWorker(args)
+	o, e := parseWorkerWithProfile(args, profile)
 	if e != nil {
 		return e
 	}
@@ -131,7 +135,7 @@ func runWorker(ctx context.Context, args []string, out io.Writer) error {
 	if e != nil {
 		return e
 	}
-	ref, e := ingest.Process(ctx, source, sink, o.archive, scanner, provadapter.Parser{}, job, o.id, o.subjects, o.archive.Limits.Archive, o.maxSBOM)
+	ref, e := ingest.Process(ctx, source, sink, o.archive, scanner, provadapter.Parser{}, job, o.id, o.subjects, o.archive.Limits.Archive, o.archive.Limits.Entry, o.maxSBOM)
 	if e != nil {
 		return e
 	}

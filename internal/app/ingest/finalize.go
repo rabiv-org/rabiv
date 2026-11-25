@@ -19,7 +19,7 @@ type FinalizeRequest struct {
 	ManifestID, WorkflowID, GroupID string
 	Subjects                        []string
 	At                              time.Time
-	MaxArchive, MaxSBOM             int64
+	MaxArchive, MaxEntry, MaxSBOM   int64
 }
 
 // Finalize copies independently hash-checked snapshots into Ingestor's namespace.
@@ -28,8 +28,12 @@ type FinalizeRequest struct {
 // subject-to-archive extraction remains a producer claim until Phase 5 evaluation.
 func Finalize(ctx context.Context, fetch, worker acquire.Source, out acquire.Sink, q FinalizeRequest) (artifact.ObjectReference, error) {
 	var zero artifact.ObjectReference
-	if artifact.ValidateID(q.ManifestID) != nil || artifact.ValidateID(q.WorkflowID) != nil || artifact.ValidateID(q.GroupID) != nil || build.ValidateTime(q.At) != nil || len(q.Subjects) == 0 || q.MaxArchive <= 0 || q.MaxSBOM <= 0 {
+	if artifact.ValidateID(q.ManifestID) != nil || artifact.ValidateID(q.WorkflowID) != nil || artifact.ValidateID(q.GroupID) != nil || build.ValidateTime(q.At) != nil || q.JobRef.Validate() != nil || !validByteLimit(q.MaxArchive) || !validByteLimit(q.MaxEntry) || !validByteLimit(q.MaxSBOM) {
 		return zero, errors.New("invalid finalization request")
+	}
+	selected, err := subjectSelection(q.Subjects, q.JobRef.Digest)
+	if err != nil {
+		return zero, err
 	}
 	data, err := fetch.Get(ctx, q.JobRef, 1<<20)
 	if err != nil {
@@ -74,24 +78,17 @@ func Finalize(ctx context.Context, fetch, worker acquire.Source, out acquire.Sin
 	if !r.JobRef.Equal(q.JobRef) || !r.Build.Consistent(job.Build) || r.Build.ValidateComplete() != nil || job.Archive == nil || !r.Archive.Equal(*job.Archive) {
 		return zero, errors.New("worker job/archive binding mismatch")
 	}
+	if len(selected) != len(r.RequestedSubjects) {
+		return zero, errors.New("worker subject selection mismatch")
+	}
+	for _, name := range r.RequestedSubjects {
+		if !selected[name] {
+			return zero, errors.New("worker subject selection mismatch")
+		}
+	}
 	if r.Failure != nil {
 		m.Failure = r.Failure
 		return finish()
-	}
-	selected := map[string]bool{}
-	for _, name := range q.Subjects {
-		if selected[name] || name == "" {
-			return zero, errors.New("invalid subject selection")
-		}
-		selected[name] = true
-	}
-	if len(selected) != len(r.Subjects) {
-		return zero, errors.New("worker subject selection mismatch")
-	}
-	for _, s := range r.Subjects {
-		if !selected[s.Subject.Name] {
-			return zero, errors.New("worker subject selection mismatch")
-		}
 	}
 	copyObject := func(source acquire.Source, ref artifact.ObjectReference, limit int64) (artifact.ObjectReference, error) {
 		b, e := source.Get(ctx, ref, limit)
@@ -106,7 +103,7 @@ func Finalize(ctx context.Context, fetch, worker acquire.Source, out acquire.Sin
 	}
 	p := &v1.ArtifactPayload{Transport: artifact.TransportArchive{Reference: transport, MediaType: "application/zip"}, SubjectGroup: artifact.SubjectGroup{ID: q.GroupID, Subjects: []artifact.Subject{}}}
 	for _, s := range r.Subjects {
-		ref, e := copyObject(worker, s.Reference, q.MaxArchive)
+		ref, e := copyObject(worker, s.Reference, q.MaxEntry)
 		if e != nil {
 			return zero, e
 		}

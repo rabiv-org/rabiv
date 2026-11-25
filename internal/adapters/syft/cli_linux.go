@@ -54,19 +54,28 @@ func (w *bounded) Write(b []byte) (int, error) {
 // It establishes neither SBOM correctness nor complete package coverage.
 func Validate(data []byte, expected artifact.Digest) error {
 	var raw struct {
-		Descriptor struct{ Name, Version string } `json:"descriptor"`
-		Schema     struct {
+		Descriptor struct {
+			Name    string `json:"name"`
+			Version string `json:"version"`
+		} `json:"descriptor"`
+		Schema struct {
 			Version string `json:"version"`
 		} `json:"schema"`
 		Source struct {
 			Type     string `json:"type"`
 			Metadata struct {
-				Digests []struct{ Algorithm, Value string } `json:"digests"`
+				Digests []struct {
+					Algorithm string `json:"algorithm"`
+					Value     string `json:"value"`
+				} `json:"digests"`
 			} `json:"metadata"`
 		} `json:"source"`
 		Artifacts []jsonArtifact `json:"artifacts"`
 	}
-	if expected.Validate() != nil || jsoninput.Decode(data, &raw, false) != nil || raw.Descriptor.Name != "syft" || raw.Descriptor.Version == "" || raw.Schema.Version == "" || raw.Source.Type != "file" || raw.Artifacts == nil {
+	if expected.Validate() != nil || jsoninput.Decode(data, &raw, false) != nil {
+		return &acquire.InputError{Code: v1.InvalidInput}
+	}
+	if raw.Descriptor.Name != "syft" || raw.Descriptor.Version == "" || raw.Schema.Version == "" || raw.Source.Type != "file" || raw.Artifacts == nil {
 		return &acquire.InputError{Code: v1.UnsupportedInput}
 	}
 	matches := 0
@@ -139,8 +148,8 @@ func (c *CLI) Scan(parent context.Context, data []byte, digest artifact.Digest) 
 		return nil, ErrScan
 	}
 	b := out.buf.Bytes()
-	if Validate(b, digest) != nil {
-		return nil, &acquire.InputError{Code: v1.InvalidInput}
+	if err := Validate(b, digest); err != nil {
+		return nil, err
 	}
 	return bytes.Clone(b), nil
 }

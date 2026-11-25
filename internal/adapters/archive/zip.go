@@ -6,6 +6,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"hash/crc32"
 	"io/fs"
 	"path"
 	"strings"
@@ -102,7 +103,8 @@ func (r Reader) Read(ctx context.Context, data []byte, names []string) (ingest.C
 		}
 		defer func() { _ = src.Close() }()
 		b, e := acquire.ReadLimit(src, l.Entry)
-		if e != nil || uint64(len(b)) != f.UncompressedSize64 {
+		// archive/zip skips the CRC comparison for a zero CRC and no descriptor.
+		if e != nil || uint64(len(b)) != f.UncompressedSize64 || f.CRC32 == 0 && crc32.ChecksumIEEE(b) != 0 {
 			return nil, ErrArchive
 		}
 		return b, nil

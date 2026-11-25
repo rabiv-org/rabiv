@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"fmt"
 	"io/fs"
 	"strings"
 	"testing"
@@ -82,5 +83,49 @@ func TestSafeSelectionAndHostileArchives(t *testing.T) {
 	}
 	if _, err := r.Read(context.Background(), valid, []string{"dist/中 app.bin", "dist/中 app.bin"}); err == nil {
 		t.Fatal("duplicate selection")
+	}
+}
+
+func TestStoredEntryWithZeroCRC(t *testing.T) {
+	reader := Reader{Limits: Limits{Archive: 1024, Entry: 64, Expanded: 64, Entries: 1, Ratio: 1}}
+	for _, body := range []string{"", "nonzero CRC"} {
+		var buf bytes.Buffer
+		z := zip.NewWriter(&buf)
+		f, err := z.CreateRaw(&zip.FileHeader{Name: "selected", Method: zip.Store, CompressedSize64: uint64(len(body)), UncompressedSize64: uint64(len(body))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Write([]byte(body)); err != nil {
+			t.Fatal(err)
+		}
+		if err := z.Close(); err != nil {
+			t.Fatal(err)
+		}
+		_, err = reader.Read(context.Background(), buf.Bytes(), []string{"selected"})
+		if (err == nil) != (body == "") {
+			t.Fatalf("declared zero CRC with body %q: %v", body, err)
+		}
+	}
+}
+
+func BenchmarkZIPDirectoryRejection(b *testing.B) {
+	var transport bytes.Buffer
+	z := zip.NewWriter(&transport)
+	for i := range 65537 {
+		if _, err := z.CreateRaw(&zip.FileHeader{Name: fmt.Sprintf("item-%05d", i), Method: zip.Store}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := z.Close(); err != nil {
+		b.Fatal(err)
+	}
+	reader := Reader{Limits: Limits{Archive: 32 << 20, Entry: 16 << 20, Expanded: 48 << 20, Entries: 1024, Ratio: 100}}
+	b.SetBytes(int64(transport.Len()))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := reader.Read(b.Context(), transport.Bytes(), []string{"item-00000"}); err != ErrArchive {
+			b.Fatalf("rejected directory: %v", err)
+		}
 	}
 }

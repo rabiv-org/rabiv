@@ -4,7 +4,6 @@
 package input
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -88,6 +87,11 @@ func open(c Config, writer bool) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	info, err := r.Stat(".")
+	if err != nil || metadata(info, 0, 0, 0755, true) != nil {
+		_ = r.Close()
+		return nil, ErrUnsafe
+	}
 	return layout(r, c, writer)
 }
 
@@ -111,6 +115,9 @@ func anchor(name string) (*os.Root, error) {
 	r, err := os.OpenRoot("/")
 	if err != nil {
 		return nil, err
+	}
+	if name == "/" {
+		return r, nil
 	}
 	for _, part := range strings.Split(strings.TrimPrefix(name, "/"), "/") {
 		info, e := r.Lstat(part)
@@ -137,11 +144,6 @@ func anchor(name string) (*os.Root, error) {
 			return nil, e
 		}
 		r = next
-	}
-	info, err := r.Stat(".")
-	if err != nil || metadata(info, 0, 0, 0755, true) != nil {
-		_ = r.Close()
-		return nil, ErrUnsafe
 	}
 	return r, nil
 }
@@ -233,16 +235,12 @@ func (s *Store) Get(ctx context.Context, ref artifact.ObjectReference, limit int
 	if err != nil {
 		return nil, err
 	}
-	f, err := openFile(s.committed, name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	f, size, err := s.openCommitted(name)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = f.Close() }()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if metadata(info, s.cfg.WriterUID, s.cfg.ReaderGID, 0440, false) != nil || info.Size() > limit {
+	if size > limit {
 		return nil, ErrUnsafe
 	}
 	b, err := acquire.ReadLimit(f, limit)
@@ -256,6 +254,46 @@ func (s *Store) Get(ctx context.Context, ref artifact.ObjectReference, limit int
 		return nil, err
 	}
 	return b, nil
+}
+
+func (s *Store) openCommitted(name string) (*os.File, int64, error) {
+	f, err := openFile(s.committed, name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, 0, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, 0, err
+	}
+	if metadata(info, s.cfg.WriterUID, s.cfg.ReaderGID, 0440, false) != nil {
+		_ = f.Close()
+		return nil, 0, ErrUnsafe
+	}
+	return f, info.Size(), nil
+}
+
+func (s *Store) verifyRetry(ctx context.Context, name string, size int64, want artifact.Digest) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	f, existingSize, err := s.openCommitted(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	if existingSize != size {
+		return ErrConflict
+	}
+	h := sha256.New()
+	n, err := io.Copy(h, io.LimitReader(f, size+1))
+	if err != nil {
+		return err
+	}
+	if n != size || hex.EncodeToString(h.Sum(nil)) != want.Value {
+		return ErrConflict
+	}
+	return ctx.Err()
 }
 
 func (s *Store) syncDir(r *os.Root) error {
@@ -273,7 +311,7 @@ func (s *Store) syncDir(r *os.Root) error {
 // This is producer protocol immutability, not protection from that producer/root.
 func (s *Store) Put(ctx context.Context, id string, src io.Reader, limit int64) (artifact.ObjectReference, error) {
 	var zero artifact.ObjectReference
-	if !s.write || limit <= 0 || limit > 1<<30 {
+	if !s.write || limit <= 0 || limit > acquire.MaxObjectBytes {
 		return zero, ErrUnsafe
 	}
 	if err := ctx.Err(); err != nil {
@@ -313,16 +351,8 @@ func (s *Store) Put(ctx context.Context, id string, src io.Reader, limit int64) 
 	ref := artifact.ObjectReference{ID: id, Digest: artifact.Digest{Algorithm: "sha256", Value: hex.EncodeToString(h.Sum(nil))}}
 	err = s.root.Link("staging/"+tmp, "committed/"+name)
 	if errors.Is(err, os.ErrExist) {
-		before, e := s.Get(ctx, ref, limit)
-		if errors.Is(e, ErrIntegrity) {
-			return zero, ErrConflict
-		}
-		if e != nil {
-			return zero, e
-		}
-		// Get checks the full existing snapshot, including its exact hash.
-		if !bytes.Equal(h.Sum(nil), shaBytes(before)) {
-			return zero, ErrConflict
+		if err := s.verifyRetry(ctx, name, n, ref.Digest); err != nil {
+			return zero, err
 		}
 	} else if err != nil {
 		return zero, err
@@ -338,5 +368,3 @@ func (s *Store) Put(ctx context.Context, id string, src io.Reader, limit int64) 
 	}
 	return ref, nil
 }
-
-func shaBytes(b []byte) []byte { h := sha256.Sum256(b); return h[:] }

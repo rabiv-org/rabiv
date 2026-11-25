@@ -149,12 +149,37 @@ func TestAcquisitionOptionsPreserveExactSubjectsAndLimits(t *testing.T) {
 		t.Fatalf("worker selection or defaults changed: %+v %v", w, err)
 	}
 	f, err := parseFinalize(args)
-	if err != nil || !slices.Equal(f.subjects, names) || f.workerRef != "" || f.maxArchive != 32<<20 || f.maxSBOM != 8<<20 {
+	if err != nil || !slices.Equal(f.subjects, names) || f.workerRef != "" || f.maxArchive != 32<<20 || f.maxEntry != 16<<20 || f.maxSBOM != 8<<20 {
 		t.Fatalf("finalizer selection or missing-worker semantics changed: %+v %v", f, err)
 	}
 	custom, err := parseWorker(append(args, "--max-archive", "4096", "--max-entry", "1024", "--max-expanded", "8192", "--max-entries", "3", "--max-ratio", "5", "--max-sbom", "2048"))
 	if err != nil || custom.archive.Limits.Archive != 4096 || custom.archive.Limits.Entry != 1024 || custom.archive.Limits.Expanded != 8192 || custom.archive.Limits.Entries != 3 || custom.archive.Limits.Ratio != 5 || custom.maxSBOM != 2048 {
 		t.Fatal("explicit worker limits changed")
+	}
+}
+
+func TestTrustedWorkerProfileIsNotARequestFlag(t *testing.T) {
+	profile := "/etc/example/profile.json"
+	want := []string{"profile", "--profile", "--profile=/other", "--request-stdin"}
+	o, err := parseWorkerWithProfile([]string{"--subject", "profile", "--subject", "--profile", "--subject=--profile=/other", "--subject", "--request-stdin"}, profile)
+	if err != nil || !slices.Equal(o.subjects, want) || o.profile != profile {
+		t.Fatalf("profile-looking subject values changed: %+v %v", o, err)
+	}
+	for _, arguments := range [][]string{{"--profile", "/other"}, {"-profile=/other"}, {"--request-stdin"}} {
+		if _, err := parseWorkerWithProfile(arguments, profile); err == nil {
+			t.Fatalf("accepted reserved request argument %q", arguments)
+		}
+	}
+}
+
+func TestFinalizeRejectsExplicitlyEmptyWorkerRef(t *testing.T) {
+	if _, err := parseFinalize(nil); err != nil {
+		t.Fatalf("omitted reference incorrectly rejected: %v", err)
+	}
+	for _, arguments := range [][]string{{"--worker-ref", ""}, {"--worker-ref="}} {
+		if _, err := parseFinalize(arguments); err == nil {
+			t.Fatalf("accepted invalid explicit reference: %q", arguments)
+		}
 	}
 }
 

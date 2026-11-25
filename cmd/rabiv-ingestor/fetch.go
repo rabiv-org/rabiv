@@ -102,7 +102,7 @@ func runFetch(ctx context.Context, args []string, out io.Writer) error {
 		return e
 	}
 	defer client.Close()
-	refs, e := ingest.FetchTo(ctx, client, ingest.FetchChannels{Collector: collect, Worker: work, Finalizer: final}, o.id, o.build, time.Now().UTC(), o.maxArchive)
+	refs, e := ingest.FetchTo(ctx, client, ingest.FetchChannels{Collector: collect, Worker: work, Finalizer: final}, o.id, o.build, time.Now().UTC(), o.maxArchive, o.timeout)
 	return writeFetchResult(out, refs, e)
 }
 

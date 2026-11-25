@@ -2,6 +2,7 @@ package syft
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	v1 "github.com/rabiv-org/rabiv/contracts/v1"
 	"github.com/rabiv-org/rabiv/internal/app/acquire"
 )
 
@@ -74,5 +76,35 @@ func TestSBOMBindingAndFormat(t *testing.T) {
 		if Validate([]byte(raw), d) == nil {
 			t.Fatal("unbound/unsupported SBOM accepted")
 		}
+	}
+}
+
+func TestScanPreservesSBOMClassification(t *testing.T) {
+	workspace := t.TempDir()
+	if err := os.Chmod(workspace, 0700); err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(Config{Binary: "/usr/bin/syft", Workspace: workspace, Timeout: time.Second, MaxOutput: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("subject")
+	d := acquire.Hash(data)
+	for _, tc := range []struct {
+		name, output string
+		code         v1.FailureCode
+	}{
+		{"unsupported source", strings.Replace(sbom(d.Value), `"file"`, `"image"`, 1), v1.UnsupportedInput},
+		{"malformed JSON", `{`, v1.InvalidInput},
+		{"wrong digest", sbom(strings.Repeat("a", 64)), v1.InvalidInput},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c.run = func(cmd *exec.Cmd) error { _, err := io.WriteString(cmd.Stdout, tc.output); return err }
+			_, err := c.Scan(context.Background(), data, d)
+			var input *acquire.InputError
+			if !errors.As(err, &input) || input.Code != tc.code {
+				t.Fatalf("got %v, want %s", err, tc.code)
+			}
+		})
 	}
 }

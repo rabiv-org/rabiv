@@ -54,7 +54,7 @@ func TestWorkerObjectReadFailureDoesNotBecomeProducerFailure(t *testing.T) {
 			fetch, jobRef, _ := fetchedFixture(t)
 			readErr := errors.New("object storage unavailable or integrity check failed")
 			out := &memory{}
-			ref, err := Process(context.Background(), objectReadFailure{source: fetch, id: failedID, err: readErr}, out, nil, nil, nil, jobRef, "worker", []string{"subject"}, 1024, 1024)
+			ref, err := Process(context.Background(), objectReadFailure{source: fetch, id: failedID, err: readErr}, out, nil, nil, nil, jobRef, "worker", []string{"subject"}, 1024, 1024, 1024)
 			if !errors.Is(err, readErr) || ref != (artifact.ObjectReference{}) || len(out.data) != 0 {
 				t.Fatalf("read failure fabricated a producer record: ref=%+v err=%v objects=%d", ref, err, len(out.data))
 			}
@@ -66,18 +66,18 @@ func TestWorkerTamperedArchiveDoesNotProduceAcknowledgement(t *testing.T) {
 	fetch, jobRef, job := fetchedFixture(t)
 	fetch.data[job.Archive.ID] = []byte("tampered after snapshot reference was created")
 	out := &memory{}
-	ref, err := Process(context.Background(), fetch, out, nil, nil, nil, jobRef, "worker", []string{"subject"}, 1024, 1024)
+	ref, err := Process(context.Background(), fetch, out, nil, nil, nil, jobRef, "worker", []string{"subject"}, 1024, 1024, 1024)
 	if err == nil || ref != (artifact.ObjectReference{}) || len(out.data) != 0 {
 		t.Fatalf("archive integrity failure was hidden: err=%v ref=%+v", err, ref)
 	}
 }
 
 func TestFinalizerDistinguishesMissingFailedAndInvalidWorker(t *testing.T) {
-	for _, scenario := range []string{"absent_reference", "producer_failed", "missing_object", "storage_unavailable", "tampered_object", "invalid_json", "wrong_build", "wrong_archive", "wrong_job_ref"} {
+	for _, scenario := range []string{"absent_reference", "producer_failed", "producer_failed_after_partial_output", "missing_object", "storage_unavailable", "tampered_object", "invalid_json", "wrong_build", "wrong_archive", "wrong_job_ref", "wrong_selection_empty_output", "wrong_selection_partial_output", "missing_selection", "legacy_result"} {
 		t.Run(scenario, func(t *testing.T) {
 			fetch, jobRef, job := fetchedFixture(t)
 			work, out := &memory{}, &memory{}
-			r := WorkerResult{Version: acquire.Version, Build: job.Build, JobRef: jobRef, Archive: *job.Archive, Subjects: []SubjectObject{}, SBOMs: []SBOMObject{}, Issues: []string{}, Failure: &v1.Failure{Code: v1.UnsupportedInput}}
+			r := WorkerResult{Version: workerResultVersion, Build: job.Build, JobRef: jobRef, Archive: *job.Archive, RequestedSubjects: []string{"subject", "second"}, Subjects: []SubjectObject{}, SBOMs: []SBOMObject{}, Issues: []string{}, Failure: &v1.Failure{Code: v1.UnsupportedInput}}
 			switch scenario {
 			case "wrong_build":
 				r.Build.Identity.JobID = "23"
@@ -85,6 +85,20 @@ func TestFinalizerDistinguishesMissingFailedAndInvalidWorker(t *testing.T) {
 				r.Archive.Digest = acquire.Hash([]byte("different archive"))
 			case "wrong_job_ref":
 				r.JobRef.ID = "different-job"
+			case "missing_selection":
+				r.RequestedSubjects = []string{}
+			case "legacy_result":
+				r.Version = acquire.Version
+			}
+			if scenario == "producer_failed_after_partial_output" || scenario == "wrong_selection_partial_output" {
+				ref := artifact.ObjectReference{ID: "partial", Digest: acquire.Hash([]byte("partial bytes"))}
+				r.Subjects = []SubjectObject{{Subject: artifact.Subject{Name: "subject", Digest: ref.Digest}, Reference: ref}}
+			}
+			if scenario == "wrong_selection_empty_output" || scenario == "wrong_selection_partial_output" {
+				r.RequestedSubjects[1] = "wrong-name"
+				if err := r.Validate(); err != nil {
+					t.Fatalf("binding test requires independently valid input: %v", err)
+				}
 			}
 			b, e := json.Marshal(r)
 			if e != nil {
@@ -97,7 +111,7 @@ func TestFinalizerDistinguishesMissingFailedAndInvalidWorker(t *testing.T) {
 			if e != nil {
 				t.Fatal(e)
 			}
-			q := FinalizeRequest{JobRef: jobRef, WorkerRef: &ref, ManifestID: "manifest", WorkflowID: "workflow", GroupID: "group", Subjects: []string{"subject"}, At: job.RecordedAt, MaxArchive: 1024, MaxSBOM: 1024}
+			q := FinalizeRequest{JobRef: jobRef, WorkerRef: &ref, ManifestID: "manifest", WorkflowID: "workflow", GroupID: "group", Subjects: []string{"second", "subject"}, At: job.RecordedAt, MaxArchive: 1024, MaxEntry: 1024, MaxSBOM: 1024}
 			var source acquire.Source = work
 			switch scenario {
 			case "absent_reference":
@@ -110,7 +124,7 @@ func TestFinalizerDistinguishesMissingFailedAndInvalidWorker(t *testing.T) {
 				work.data[ref.ID] = []byte("mutated after reference creation")
 			}
 			result, err := Finalize(context.Background(), fetch, source, out, q)
-			if scenario == "absent_reference" || scenario == "producer_failed" {
+			if scenario == "absent_reference" || scenario == "producer_failed" || scenario == "producer_failed_after_partial_output" {
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -119,7 +133,7 @@ func TestFinalizerDistinguishesMissingFailedAndInvalidWorker(t *testing.T) {
 					t.Fatal(e)
 				}
 				want := v1.InputUnavailable
-				if scenario == "producer_failed" {
+				if q.WorkerRef != nil {
 					want = v1.UnsupportedInput
 				}
 				if manifest.State != v1.Failed || manifest.Failure.Code != want || manifest.Payload != nil {

@@ -21,6 +21,9 @@ func fixture(t *testing.T) *Store {
 	if err := os.Mkdir(filepath.Join(dir, "staging"), 0700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(filepath.Join(dir, "staging"), 0700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Mkdir(filepath.Join(dir, "committed"), 0750); err != nil {
 		t.Fatal(err)
 	}
@@ -58,6 +61,12 @@ func TestSnapshots(t *testing.T) {
 	if _, err := s.Put(ctx, "record", bytes.NewBufferString("different"), 1024); !errors.Is(err, ErrConflict) {
 		t.Fatalf("conflict: %v", err)
 	}
+	if _, err := s.Put(ctx, "record", bytes.NewBufferString("short"), 5); !errors.Is(err, ErrConflict) {
+		t.Fatalf("size mismatch was not a conflict: %v", err)
+	}
+	if _, err := s.Put(ctx, "record", bytes.NewReader(bytes.Repeat([]byte("x"), len(payload))), 1024); !errors.Is(err, ErrConflict) {
+		t.Fatalf("same size with different bytes was not a conflict: %v", err)
+	}
 	if _, err := s.Put(ctx, "oversize", bytes.NewReader(payload), 1); err == nil {
 		t.Fatal("accepted oversize")
 	}
@@ -85,6 +94,7 @@ func TestConcurrentCommit(t *testing.T) {
 	payload := bytes.Repeat([]byte("x"), 1<<18)
 	ref := artifact.ObjectReference{ID: "concurrent", Digest: acquire.Hash(payload)}
 	var wg sync.WaitGroup
+	defer wg.Wait()
 	for range 4 {
 		wg.Go(func() {
 			for range 50 {
@@ -102,7 +112,6 @@ func TestConcurrentCommit(t *testing.T) {
 	if _, err := s.Put(ctx, ref.ID, bytes.NewReader(payload), int64(len(payload))); err != nil {
 		t.Fatal(err)
 	}
-	wg.Wait()
 }
 
 func TestSynchronizationOutcomes(t *testing.T) {

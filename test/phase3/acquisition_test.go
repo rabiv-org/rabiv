@@ -106,7 +106,7 @@ func TestFetchWorkerFinalizeAndNegativeBindings(t *testing.T) {
 	collect, workFetch, finalFetch, results, final := &channel{}, &channel{}, &channel{}, &channel{}, &channel{}
 	id := build.Identity{Provider: build.GitLab, Instance: "https://ci.example", ProjectID: "5", JobID: "27"}
 	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	refs, err := ingest.FetchTo(ctx, ci{archiveBytes(t)}, ingest.FetchChannels{Collector: collect, Worker: workFetch, Finalizer: finalFetch}, "fetch", id, at, 1<<20)
+	refs, err := ingest.FetchTo(ctx, ci{archiveBytes(t)}, ingest.FetchChannels{Collector: collect, Worker: workFetch, Finalizer: finalFetch}, "fetch", id, at, 1<<20, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestFetchWorkerFinalizeAndNegativeBindings(t *testing.T) {
 	}
 	reader := zipadapter.Reader{Limits: zipadapter.Limits{Archive: 1 << 20, Entry: 1 << 18, Expanded: 1 << 19, Entries: 16, Ratio: 100}, ProvenanceEntry: "artifacts-metadata.json"}
 	names := []string{"dist/a.bin", "dist/中.bin"}
-	workerRef, err := ingest.Process(ctx, workFetch, results, reader, scanner{}, provadapter.Parser{}, refs.Worker, "worker", names, 1<<20, 1<<20)
+	workerRef, err := ingest.Process(ctx, workFetch, results, reader, scanner{}, provadapter.Parser{}, refs.Worker, "worker", names, 1<<20, 1<<18, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestFetchWorkerFinalizeAndNegativeBindings(t *testing.T) {
 	if !slices.Contains(wr.Issues, "PROVENANCE_INVALID_DEPENDENCY_DIGEST") || wr.Provenance.ClaimedBuild != nil {
 		t.Fatal("upstream invalid claim repaired or hidden")
 	}
-	request := ingest.FinalizeRequest{JobRef: refs.Finalizer, WorkerRef: &workerRef, ManifestID: "manifest", WorkflowID: "workflow", GroupID: "subjects", Subjects: names, At: at, MaxArchive: 1 << 20, MaxSBOM: 1 << 20}
+	request := ingest.FinalizeRequest{JobRef: refs.Finalizer, WorkerRef: &workerRef, ManifestID: "manifest", WorkflowID: "workflow", GroupID: "subjects", Subjects: names, At: at, MaxArchive: 1 << 20, MaxEntry: 1 << 18, MaxSBOM: 1 << 20}
 	ref, err := ingest.Finalize(ctx, finalFetch, results, final, request)
 	if err != nil {
 		t.Fatal(err)
@@ -148,7 +148,7 @@ func TestFetchWorkerFinalizeAndNegativeBindings(t *testing.T) {
 		}
 	}
 	request.ManifestID = "wrong-selection"
-	request.Subjects = []string{"dist/wrong.bin"}
+	request.Subjects = []string{"dist/a.bin", "dist/wrong.bin"}
 	if _, err = ingest.Finalize(ctx, finalFetch, results, final, request); err == nil {
 		t.Fatal("accepted wrong selection")
 	}
@@ -168,7 +168,7 @@ func TestFetchWorkerFinalizeAndNegativeBindings(t *testing.T) {
 		t.Fatal("accepted cross-job substitution")
 	}
 	request.ManifestID = "failed"
-	failedRef, e := ingest.Process(ctx, workFetch, results, reader, scanner{failure: true}, provadapter.Parser{}, refs.Worker, "failed-worker", names, 1<<20, 1<<20)
+	failedRef, e := ingest.Process(ctx, workFetch, results, reader, scanner{failure: true}, provadapter.Parser{}, refs.Worker, "failed-worker", names, 1<<20, 1<<18, 1<<20)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -215,7 +215,7 @@ func TestEmptyProvenanceIsAvailableButMalformed(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	workerRef, e := ingest.Process(ctx, fetch, out, zipadapter.Reader{Limits: zipadapter.Limits{Archive: 1 << 20, Entry: 1 << 18, Expanded: 1 << 19, Entries: 16, Ratio: 100}, ProvenanceEntry: "artifacts-metadata.json"}, scanner{}, provadapter.Parser{}, r, "worker", []string{"out/subject"}, 1<<20, 1<<20)
+	workerRef, e := ingest.Process(ctx, fetch, out, zipadapter.Reader{Limits: zipadapter.Limits{Archive: 1 << 20, Entry: 1 << 18, Expanded: 1 << 19, Entries: 16, Ratio: 100}, ProvenanceEntry: "artifacts-metadata.json"}, scanner{}, provadapter.Parser{}, r, "worker", []string{"out/subject"}, 1<<20, 1<<18, 1<<20)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -225,5 +225,54 @@ func TestEmptyProvenanceIsAvailableButMalformed(t *testing.T) {
 	}
 	if result.ProvenanceRaw == nil || result.ProvenanceRaw.Digest != acquire.Hash(nil) || result.Provenance != nil || !slices.Contains(result.Issues, "PROVENANCE_MALFORMED") || slices.Contains(result.Issues, "PROVENANCE_MISSING") {
 		t.Fatalf("empty metadata conflated with absence: %+v", result)
+	}
+}
+
+func TestExpandedSubjectCanExceedTransportLimit(t *testing.T) {
+	ctx := t.Context()
+	var transport bytes.Buffer
+	z := zip.NewWriter(&transport)
+	w, err := z.Create("dist/compressible")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := bytes.Repeat([]byte("build output"), 1024)
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := z.Close(); err != nil {
+		t.Fatal(err)
+	}
+	maxArchive := int64(transport.Len())
+	maxEntry := int64(len(data))
+	if maxEntry <= maxArchive {
+		t.Fatal("test must expand beyond the transport budget")
+	}
+	id := build.Identity{Provider: build.GitLab, Instance: "https://ci.example", ProjectID: "1", JobID: "27"}
+	fetch, results, output := &channel{}, &channel{}, &channel{}
+	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	job, err := ingest.Fetch(ctx, ci{transport.Bytes()}, fetch, "fetched", id, at, maxArchive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := []string{"dist/compressible"}
+	reader := zipadapter.Reader{Limits: zipadapter.Limits{Archive: maxArchive, Entry: maxEntry, Expanded: maxEntry, Entries: 1, Ratio: 1000}}
+	result, err := ingest.Process(ctx, fetch, results, reader, scanner{}, provadapter.Parser{}, job, "worker", names, maxArchive, maxEntry, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := ingest.FinalizeRequest{JobRef: job, WorkerRef: &result, ManifestID: "manifest", WorkflowID: "workflow", GroupID: "group", Subjects: names, At: at, MaxArchive: maxArchive, MaxEntry: maxEntry, MaxSBOM: 1 << 20}
+	q.MaxEntry--
+	if _, err := ingest.Finalize(ctx, fetch, results, output, q); err == nil {
+		t.Fatal("accepted a subject above the Finalizer expanded-entry limit")
+	}
+	q.MaxEntry++
+	ref, err := ingest.Finalize(ctx, fetch, results, output, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := v1.DecodeArtifactManifest(output.data[ref.ID])
+	if err != nil || manifest.State != v1.Finalized || manifest.Payload.SubjectGroup.Subjects[0].Digest != acquire.Hash(data) {
+		t.Fatalf("expanded bytes did not reach final manifest intact: %v", err)
 	}
 }

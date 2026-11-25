@@ -42,7 +42,7 @@ func TestProcessRejectsInvalidRequestBeforeIO(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := &sourceProbe{}
-			ref, err := Process(context.Background(), p, &memory{}, nil, nil, nil, tc.ref, tc.id, tc.names, tc.archive, tc.sbom)
+			ref, err := Process(context.Background(), p, &memory{}, nil, nil, nil, tc.ref, tc.id, tc.names, tc.archive, 1024, tc.sbom)
 			if err == nil || errors.Is(err, errProbeRead) || p.reads != 0 || ref != (artifact.ObjectReference{}) {
 				t.Fatalf("invalid request reached input: reads=%d ref=%+v err=%v", p.reads, ref, err)
 			}
@@ -53,7 +53,7 @@ func TestProcessRejectsInvalidRequestBeforeIO(t *testing.T) {
 func TestProcessPreservesValidLogicalSelection(t *testing.T) {
 	probe := &sourceProbe{}
 	r := artifact.ObjectReference{ID: "fetch", Digest: acquire.Hash([]byte("fetch"))}
-	_, err := Process(context.Background(), probe, &memory{}, nil, nil, nil, r, "worker", []string{"dist/中 app.bin", "e\u0301.bin", "é.bin"}, 1024, 1024)
+	_, err := Process(context.Background(), probe, &memory{}, nil, nil, nil, r, "worker", []string{"dist/中 app.bin", "e\u0301.bin", "é.bin"}, 1024, 1024, 1024)
 	if !errors.Is(err, errProbeRead) || probe.reads != 1 {
 		t.Fatal("valid exact logical names rejected before input acquisition")
 	}
