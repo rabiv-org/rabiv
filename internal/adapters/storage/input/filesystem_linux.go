@@ -104,8 +104,12 @@ func metadata(info os.FileInfo, uid, gid int, mode os.FileMode, dir bool) error 
 }
 
 func ancestor(info os.FileInfo) error {
+	return trustedAncestor(info, 0)
+}
+
+func trustedAncestor(info os.FileInfo, owner uint32) error {
 	s, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || !info.IsDir() || s.Uid != 0 || info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 || info.Mode().Perm()&0022 != 0 {
+	if !ok || !info.IsDir() || s.Uid != owner || info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 || info.Mode().Perm()&0022 != 0 {
 		return ErrUnsafe
 	}
 	return nil
