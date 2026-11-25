@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"io"
 	"time"
@@ -22,7 +23,7 @@ import (
 // The output object retains unresolved events and original capture reference.
 func Produce(ctx context.Context, source acquire.Source, sink acquire.Sink, captureRef artifact.ObjectReference, targets []build.Context, job build.Identity, workflow, id string, at time.Time, maxCapture int64) (artifact.ObjectReference, error) {
 	var zero artifact.ObjectReference
-	if job.Validate() != nil || artifact.ValidateID(id) != nil || artifact.ValidateID(workflow) != nil || artifact.ValidateID(id+".evidence") != nil || build.ValidateTime(at) != nil {
+	if job.Validate() != nil || artifact.ValidateID(id) != nil || artifact.ValidateID(workflow) != nil || artifact.ValidateID(id+".evidence") != nil || build.ValidateTime(at) != nil || maxCapture <= 0 || maxCapture > correlate.MaxCaptureBytes {
 		return zero, errors.New("invalid evidence production request")
 	}
 	var selected *build.Context
@@ -35,6 +36,12 @@ func Produce(ctx context.Context, source acquire.Source, sink acquire.Sink, capt
 		return zero, errors.New("target job is not supplied")
 	}
 	if selected.ValidateComplete() != nil {
+		var budget correlate.TargetBudget
+		for _, target := range targets {
+			if err := budget.Add(target); err != nil {
+				return zero, err
+			}
+		}
 		m := v1.EvidenceManifest{ManifestHeader: v1.ManifestHeader{SchemaVersion: v1.SchemaVersion, Kind: v1.KindEvidenceManifest, ManifestID: id, WorkflowID: workflow, Build: *selected, RecordedAt: at, State: v1.Failed, Failure: &v1.Failure{Code: v1.InputUnavailable}}}
 		if e := m.Validate(); e != nil {
 			return zero, e
@@ -43,20 +50,13 @@ func Produce(ctx context.Context, source acquire.Source, sink acquire.Sink, capt
 		if e != nil {
 			return zero, e
 		}
-		return sink.Put(ctx, id, bytes.NewReader(b), 1<<20)
-	}
-	if maxCapture <= 0 || maxCapture > acquire.MaxObjectBytes {
-		return zero, errors.New("invalid capture byte limit")
+		return sink.Put(ctx, id, bytes.NewReader(b), correlate.MaxManifestBytes)
 	}
 	b, err := source.Get(ctx, captureRef, maxCapture)
 	if err != nil {
 		return zero, err
 	}
-	c, err := correlate.DecodeCapture(b, maxCapture)
-	if err != nil {
-		return zero, err
-	}
-	r, err := correlate.Resolve(c, targets)
+	c, r, err := correlate.DecodeAndResolve(b, maxCapture, targets)
 	if err != nil {
 		return zero, err
 	}
@@ -113,25 +113,29 @@ func Produce(ctx context.Context, source acquire.Source, sink acquire.Sink, capt
 	if _, err = v1.DecodeEvidenceManifest(encoded); err != nil {
 		return zero, err
 	}
-	return sink.Put(ctx, id, bytes.NewReader(encoded), 1<<20)
+	return sink.Put(ctx, id, bytes.NewReader(encoded), correlate.MaxManifestBytes)
 }
 
 // Correlation adds per-record fields and may repeat build/scope metadata, so
 // capture size is not a reliable output limit. A separate object budget counts
 // actual encoded bytes at Put, without buffering the entire expanded JSON.
 func putEvidence(ctx context.Context, sink acquire.Sink, id string, ref artifact.ObjectReference, r correlate.Result) (artifact.ObjectReference, error) {
+	return putObject(ctx, sink, id, correlate.MaxEvidenceBytes, func(w io.Writer) error { return encodeEvidence(ctx, w, ref, r) })
+}
+
+func putObject(ctx context.Context, sink acquire.Sink, id string, limit int64, encode func(io.Writer) error) (artifact.ObjectReference, error) {
 	pr, pw := io.Pipe()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		w := bufio.NewWriter(pw)
-		err := encodeEvidence(ctx, w, ref, r)
+		err := encode(w)
 		if err == nil {
 			err = w.Flush()
 		}
 		_ = pw.CloseWithError(err)
 	}()
-	result, err := sink.Put(ctx, id, pr, acquire.MaxObjectBytes)
+	result, err := sink.Put(ctx, id, pr, limit)
 	_ = pr.Close()
 	<-done
 	return result, err
@@ -181,10 +185,5 @@ func encodeRows[T any](ctx context.Context, w io.Writer, prefix string, rows []T
 }
 
 func writeJSON(w io.Writer, value any) error {
-	data, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-	_, err = w.Write(data)
-	return err
+	return jsonv2.MarshalWrite(w, value, json.DefaultOptionsV1())
 }

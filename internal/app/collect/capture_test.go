@@ -94,6 +94,72 @@ func TestCaptureByteBudgetPreservesUnknownCoverage(t *testing.T) {
 	}
 }
 
+type scopeBudgetDocker struct {
+	dockerSource
+	ready <-chan struct{}
+	rows  []correlate.Container
+}
+
+func (d *scopeBudgetDocker) Inventory(ctx context.Context) ([]correlate.Container, error) {
+	if _, err := d.dockerSource.Inventory(ctx); err != nil {
+		return nil, err
+	}
+	select {
+	case <-d.ready:
+		return d.rows, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestCaptureScopeBudgetUnderDefaultSettingsPreservesAcceptedEvidence(t *testing.T) {
+	at := time.Now().UTC()
+	ready := make(chan struct{})
+	id := strings.Repeat("a", 64)
+	d := &scopeBudgetDocker{dockerSource: dockerSource{t: t, stream: &lifecycle{done: make(chan struct{})}}, ready: ready}
+	for _, container := range []string{id, strings.Repeat("b", 64)} {
+		d.rows = append(d.rows, correlate.Container{ID: container, At: at, StartedAt: &at, JobID: "12", ProjectID: "6", RawRole: strings.Repeat("r", 600<<10)})
+	}
+	runtime := &heldRuntime{lifecycle: lifecycle{done: make(chan struct{})}, events: []correlate.Event{{Kind: correlate.ProcessExec, At: at, Source: "TETRAGON", ExecID: "observed", ContainerID: id[:16]}}}
+	c, err := Capture(context.Background(), CaptureConfig{ID: "capture", HostID: "host", BootID: "boot", Duration: 12 * time.Minute, InventoryInterval: time.Second, MaxBytes: 64 << 20, MaxRecords: 100000, Ready: func() { close(ready) }}, d, runtime)
+	if err == nil || !c.Interrupted || c.Dropped != 1 || len(c.Containers) != 1 || len(c.Events) != 1 || c.Containers[0].RawRole != d.rows[0].RawRole || c.Events[0].ExecID != "observed" {
+		t.Fatalf("scope exhaustion lost accepted evidence: containers=%d events=%d drops=%d err=%v", len(c.Containers), len(c.Events), c.Dropped, err)
+	}
+	var found bool
+	for _, gap := range c.Gaps {
+		found = found || gap.Code == evidence.ObservationInterrupted
+	}
+	if !found {
+		t.Fatal("scope exhaustion did not retain interruption gap")
+	}
+	objects := &memory{data: map[string][]byte{}}
+	ref, err := StoreCapture(context.Background(), objects, c, 64<<20)
+	if err != nil || !bytes.Equal(objects.data[ref.ID], mustJSONCapture(t, c)) {
+		t.Fatalf("streamed capture changed bytes: %v", err)
+	}
+	if _, err := correlate.DecodeCapture(objects.data[ref.ID], 64<<20); err != nil {
+		t.Fatal(err)
+	}
+	_, jobs := evidenceFixture()
+	manifestRef, err := Produce(context.Background(), objects, objects, ref, jobs, jobs[0].Identity, "workflow", "manifest", time.Now().UTC(), 64<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := v1.DecodeEvidenceManifest(objects.data[manifestRef.ID])
+	if err != nil || m.State != v1.Failed || m.Payload.EventLoss.Status != evidence.LossReported || m.Payload.Coverage.Status != evidence.CoverageUnknown {
+		t.Fatalf("incomplete capture promoted: %v", err)
+	}
+}
+
+func mustJSONCapture(t *testing.T, c correlate.Capture) []byte {
+	t.Helper()
+	b, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
 func TestSourceReportsDoNotEstablishCaptureReadiness(t *testing.T) {
 	count := uint64(7)
 	for _, kind := range []correlate.EventKind{correlate.Unsupported, correlate.SourceLoss} {

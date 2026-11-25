@@ -113,9 +113,55 @@ its stored `interrupted` flag remains true and processing emits a FAILED manifes
 `--capture-ref`, repeated `--job-ref` metadata snapshot references, target fetched
 snapshot `--target`, `--workflow-id` and manifest `--id`. It writes an evidence
 object and strict v1 EvidenceManifest. Fetched CI metadata failure produces FAILED.
-The capture byte limit applies only to the input snapshot. Correlation can expand
-the result, so the evidence object is streamed against the input store's 1 GiB
-object ceiling. If it exceeds that ceiling there is no manifest acknowledgement.
+The supported runtime resource envelope keeps the 64 MiB / 100,000-record
+defaults. Capture configuration may lower these limits or raise the byte limit
+to at most **896 MiB**; the work/record ceiling is **100,000**. The decoder bounds
+both original bytes and canonical Go JSON encoded bytes by `--max-capture`,
+without rewriting the original bytes or their digest. Events plus container
+observations cannot exceed 100,000; diagnostic rows have a separate 100,000
+ceiling. Live capture charges records and failed reads incrementally and reserves
+4096 bytes for terminal metadata. Export streams JSON without another full
+capture buffer. Direct correlation also enforces admission; the decoded
+processing path does not repeat the encoded-byte scan.
+
+Each target's encoded identity is limited to 1 KiB and build context to 64 KiB;
+retained target contexts have a combined 1 MiB budget, checked while loading.
+These are Collector resource limits, not new domain or public v1 validity rules.
+Oversized historical inputs/configurations now fail explicitly and are never
+silently clamped or rewritten.
+
+All potential physical epochs share a weighted manifest budget of **980,992
+bytes** (1 MiB minus 64 KiB build context and 2 KiB fixed metadata). Each epoch
+reserves its worst-case encoded execution scope plus a 146-byte observation and
+two delimiters. Sizing uses actual host/boot IDs, the largest escaped role seen
+for that full-container-ID/start tuple, and maximum timestamp/role widths. It
+does not infer starts/ends, create scopes, or decide attribution. Repeated
+observations charge only weight growth; distinct starts and contradictory or
+unassociated epochs remain conservatively reserved. There is no arbitrary fixed
+container count or field truncation. **Scope budget can exhaust under default
+capture settings**, before either the capture byte or work limit. Already
+accepted observations remain; the rejected record is counted as a local drop,
+capture is interrupted, and its ACK can accompany a nonzero exit. Processing
+that capture preserves uncertainty in a FAILED manifest. An externally supplied
+snapshot outside the envelope fails before output writes, without a manifest ACK.
+
+The size proof uses canonical input bytes (so escaping is already accounted),
+at most 1131 extra bytes per event including a delimiter, at most 1048 bytes
+per correlated scope identity/wrapper, and at most 19 extra digits per input
+diagnostic count. Scopes cannot outnumber container observations. Including the
+weighted scope budget and 4096 bytes for the evidence envelope, gaps and generated
+diagnostics gives a conservative upper bound of **1,055,509,184 bytes**, below
+the unchanged **1,073,741,824-byte** storage ceiling. The v1 manifest remains
+bounded by **1 MiB**. Go encoder boundary/proof tests lock these assumptions.
+Both outputs retain actual-byte enforcement at the storage sink. Cancellation,
+disk failure, conflict and integrity errors can still prevent ACK; size admission
+does not imply successful I/O, authenticity, coverage or authorization.
+
+Consumers must read manifests at 1 MiB and runtime evidence at the shared 1 GiB
+ceiling, verifying exact bytes against references. The future Verifier evidence
+consumer is not implemented here. Memory remains proportional to decoded input
+and correlation structures; byte ceilings are not an RSS guarantee. No global
+object ceiling, public contract, storage authorization or Worker profile changes.
 
 `rabiv-ingestor worker-run --profile ROOT_OWNED_PROFILE [worker arguments]` is an
 owner-controlled root launcher for a transient systemd unit. It launches only the

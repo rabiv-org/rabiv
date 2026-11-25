@@ -10,6 +10,7 @@ import (
 	input "github.com/rabiv-org/rabiv/internal/adapters/storage/input"
 	"github.com/rabiv-org/rabiv/internal/app/acquire"
 	"github.com/rabiv-org/rabiv/internal/app/collect"
+	"github.com/rabiv-org/rabiv/internal/app/correlate"
 	"github.com/rabiv-org/rabiv/internal/domain/build"
 	"github.com/rabiv-org/rabiv/internal/platform/process"
 )
@@ -24,7 +25,7 @@ func runProcess(ctx context.Context, args []string, out io.Writer) error {
 	maxCapture := f.Int64("max-capture", 64<<20, "capture size limit")
 	var jobRefs list
 	f.Var(&jobRefs, "job-ref", "fetched metadata snapshot id@sha256hex, repeatable")
-	if f.Parse(args) != nil || f.NArg() != 0 || len(jobRefs) == 0 {
+	if f.Parse(args) != nil || f.NArg() != 0 || len(jobRefs) == 0 || *maxCapture <= 0 || *maxCapture > correlate.MaxCaptureBytes {
 		return errors.New("invalid processing arguments")
 	}
 	cc, e := input.LoadConfig(*capConfig)
@@ -77,6 +78,7 @@ func runProcess(ctx context.Context, args []string, out io.Writer) error {
 func loadTargets(ctx context.Context, fetch acquire.Source, jobRefs []string, target string) ([]build.Context, build.Identity, error) {
 	var targets []build.Context
 	var selected build.Identity
+	var budget correlate.TargetBudget
 	for _, raw := range jobRefs {
 		r, e := acquire.ParseReference(raw)
 		if e != nil {
@@ -94,6 +96,9 @@ func loadTargets(ctx context.Context, fetch acquire.Source, jobRefs []string, ta
 			return nil, build.Identity{}, errors.New("collector requires metadata-only channel")
 		}
 		if j.Build.ValidateComplete() == nil || r.ID == target {
+			if err := budget.Add(j.Build); err != nil {
+				return nil, build.Identity{}, err
+			}
 			targets = append(targets, j.Build)
 		}
 		if r.ID == target {

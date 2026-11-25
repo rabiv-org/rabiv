@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,6 +15,7 @@ import (
 	input "github.com/rabiv-org/rabiv/internal/adapters/storage/input"
 	"github.com/rabiv-org/rabiv/internal/adapters/tetragon"
 	"github.com/rabiv-org/rabiv/internal/app/collect"
+	"github.com/rabiv-org/rabiv/internal/app/correlate"
 )
 
 type captureOptions struct {
@@ -37,7 +37,7 @@ func parseCapture(args []string) (captureOptions, error) {
 	f.DurationVar(&o.capture.InventoryInterval, "inventory-interval", time.Second, "inventory reconciliation interval")
 	f.Int64Var(&o.capture.MaxBytes, "max-bytes", 64<<20, "capture size limit")
 	f.IntVar(&o.capture.MaxRecords, "max-records", 100000, "capture record count limit")
-	if f.Parse(args) != nil || f.NArg() != 0 || !*owner || o.telemetryFD < 3 {
+	if f.Parse(args) != nil || f.NArg() != 0 || !*owner || o.telemetryFD < 3 || correlate.CheckCaptureLimits(o.capture.MaxBytes, o.capture.MaxRecords) != nil {
 		return o, errors.New("invalid capture arguments")
 	}
 	o.channel, o.capture.ID = output.channel, output.id
@@ -85,14 +85,7 @@ func runCapture(ctx context.Context, args []string, out io.Writer) error {
 	}
 	c, captureErr := collect.Capture(ctx, o.capture, engine, stream)
 
-	if e = c.Validate(); e != nil {
-		return e
-	}
-	b, e := json.Marshal(c)
-	if e != nil {
-		return e
-	}
-	ref, e := sink.Put(context.WithoutCancel(ctx), o.capture.ID, bytes.NewReader(b), o.capture.MaxBytes)
+	ref, e := collect.StoreCapture(context.WithoutCancel(ctx), sink, c, o.capture.MaxBytes)
 	if e != nil {
 		return e
 	}

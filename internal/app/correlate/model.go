@@ -82,7 +82,7 @@ type Capture struct {
 	Dropped     uint64                     `json:"dropped"`
 }
 
-// Validate checks captured metadata, never runtime coverage or identity trust.
+// Validate checks metadata, never resource admission, coverage or identity trust.
 func (c Capture) Validate() error {
 	validToken := func(s string) bool {
 		if s == "" || len(s) > 128 {
@@ -133,8 +133,22 @@ func (c Capture) Validate() error {
 // DecodeCapture validates one size-bounded internal snapshot.
 func DecodeCapture(data []byte, limit int64) (Capture, error) {
 	var c Capture
-	if limit <= 0 || int64(len(data)) > limit || jsoninput.Decode(data, &c, true) != nil {
+	if limit <= 0 || limit > MaxCaptureBytes || int64(len(data)) > limit || jsoninput.Decode(data, &c, true) != nil {
 		return c, errors.New("invalid capture JSON")
 	}
-	return c, c.Validate()
+	if err := c.Validate(); err != nil {
+		return c, err
+	}
+	return c, checkCaptureEnvelope(c, limit)
+}
+
+// DecodeAndResolve avoids repeating encoded-byte admission for a snapshot that
+// DecodeCapture has just checked. Direct Resolve calls still enforce admission.
+func DecodeAndResolve(data []byte, limit int64, targets []build.Context) (Capture, Result, error) {
+	c, err := DecodeCapture(data, limit)
+	if err != nil {
+		return c, Result{}, err
+	}
+	r, err := resolve(c, targets)
+	return c, r, err
 }

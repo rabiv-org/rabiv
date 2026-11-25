@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -15,6 +16,123 @@ import (
 	"github.com/rabiv-org/rabiv/internal/domain/build"
 	"github.com/rabiv-org/rabiv/internal/domain/evidence"
 )
+
+func TestProduceRejectsManifestExpansionBeforeWritingObjects(t *testing.T) {
+	c, jobs := evidenceFixture()
+	for i := range c.Containers {
+		c.Containers[i].RawRole = strings.Repeat("r", 600<<10)
+	}
+	// Both scopes belong to one target, so the v1 manifest would exceed 1 MiB.
+	c.Containers[1].JobID = jobs[0].Identity.JobID
+	raw, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects := &memory{data: map[string][]byte{}}
+	ref, err := objects.Put(context.Background(), "capture", bytes.NewReader(raw), int64(len(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = Produce(context.Background(), objects, objects, ref, jobs, jobs[0].Identity, "workflow", "manifest", c.Window.Until, int64(len(raw)))
+	if err == nil || len(objects.data) != 1 {
+		t.Fatalf("unsupported scope envelope wrote output: err=%v objects=%d", err, len(objects.data))
+	}
+}
+
+func TestProduceRejectsTargetMetadataBeforeWritingFailedManifest(t *testing.T) {
+	_, jobs := evidenceFixture()
+	jobs[0].Source = nil
+	jobs[0].Identity.JobID = strings.Repeat("1", 1024)
+	objects := &memory{data: map[string][]byte{}}
+	_, err := Produce(context.Background(), objects, objects, artifact.ObjectReference{}, jobs, jobs[0].Identity, "workflow", "manifest", time.Now().UTC(), 1<<20)
+	if err == nil || len(objects.data) != 0 {
+		t.Fatalf("oversized incomplete target was acknowledged: %v", err)
+	}
+}
+
+func TestProduceRejectsExcessCaptureRecords(t *testing.T) {
+	c, jobs := evidenceFixture()
+	c.Events = make([]correlate.Event, 100001)
+	for i := range c.Events {
+		c.Events[i] = correlate.Event{Kind: correlate.ProcessExec, At: c.Window.From, Source: "TETRAGON", ExecID: fmt.Sprint(i)}
+	}
+	raw, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects := &memory{data: map[string][]byte{}}
+	ref, err := objects.Put(context.Background(), "capture", bytes.NewReader(raw), int64(len(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = Produce(context.Background(), objects, objects, ref, jobs, jobs[0].Identity, "workflow", "manifest", c.Window.Until, int64(len(raw)))
+	if err == nil || len(objects.data) != 1 {
+		t.Fatalf("excess records produced output: err=%v objects=%d", err, len(objects.data))
+	}
+}
+
+func TestProduceManifestAtWeightedScopeAndContextBounds(t *testing.T) {
+	c, jobs := evidenceFixture()
+	base := int64(336 + len(c.HostID) + len(c.BootID) + 148 + 14)
+	roleBytes := correlate.ScopeBudgetBytes - 2*base
+	c.Containers[0].RawRole = strings.Repeat("r", int(roleBytes/2))
+	c.Containers[1].RawRole = strings.Repeat("r", int(roleBytes-roleBytes/2))
+	c.Containers[1].JobID = jobs[0].Identity.JobID
+	b, err := json.Marshal(jobs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs[0].Source.Ref = strings.Repeat("r", int(correlate.MaxContextBytes)-len(b)-len(`,"ref":""`))
+	for _, interrupted := range []bool{false, true} {
+		c.Interrupted = interrupted
+		m, objects, _ := produceFixture(t, c, jobs, 0)
+		if len(m.Payload.Scopes) != 2 || len(m.Payload.Observations) != 2 || int64(len(objects.data["manifest"])) > correlate.MaxManifestBytes || int64(len(objects.data[m.Payload.Reference.ID])) > correlate.MaxEvidenceBytes {
+			t.Fatal("accepted maximum weights do not fit output ceilings")
+		}
+		var obj struct {
+			Result correlate.Result `json:"result"`
+		}
+		if err := json.Unmarshal(objects.data[m.Payload.Reference.ID], &obj); err != nil || len(obj.Result.Events) != len(c.Events) {
+			t.Fatalf("event retention: %v", err)
+		}
+	}
+}
+
+func TestProduceEvidenceMatchesActualEncodedEnvelope(t *testing.T) {
+	c, jobs := evidenceFixture()
+	c.Diagnostics = []correlate.Diagnostic{{Code: "unknown-<>&中", Count: 1}, {Code: "unknown-<>&中", Count: 1234567890123456789}}
+	for range 30 {
+		c.Events = append(c.Events, c.Events[0])
+	}
+	c.Events[3].ContainerID = "f"
+	c.Events[4].ContainerID = ""
+	c.Events[5].Binary = "<>&\u2028中"
+	m, objects, _ := produceFixture(t, c, jobs, 0)
+	raw, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound := int64(len(raw)) + 1131*int64(len(c.Events)+len(c.Containers)) + 19*int64(len(c.Diagnostics)) + correlate.ScopeBudgetBytes + 4096
+	if actual := int64(len(objects.data[m.Payload.Reference.ID])); actual > bound {
+		t.Fatalf("actual=%d bound=%d", actual, bound)
+	}
+	var obj struct {
+		Result correlate.Result `json:"result"`
+	}
+	if err := json.Unmarshal(objects.data[m.Payload.Reference.ID], &obj); err != nil {
+		t.Fatal(err)
+	}
+	if len(obj.Result.Events) != len(c.Events) || obj.Result.Events[3].Resolution != "UNRESOLVED" || obj.Result.Events[4].Resolution != "NO_CONTAINER_ID" {
+		t.Fatal("resource admission changed attribution")
+	}
+	found := false
+	for _, d := range obj.Result.Diagnostics {
+		found = found || d.Code == c.Diagnostics[0].Code && d.Count == 1234567890123456790
+	}
+	if !found {
+		t.Fatal("unknown diagnostics or count growth lost")
+	}
+}
 
 func evidenceFixture() (correlate.Capture, []build.Context) {
 	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)

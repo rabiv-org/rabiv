@@ -6,12 +6,52 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	v1 "github.com/rabiv-org/rabiv/contracts/v1"
 	"github.com/rabiv-org/rabiv/internal/app/acquire"
+	"github.com/rabiv-org/rabiv/internal/app/collect"
+	"github.com/rabiv-org/rabiv/internal/app/correlate"
 	"github.com/rabiv-org/rabiv/internal/domain/artifact"
+	"github.com/rabiv-org/rabiv/internal/domain/build"
+	"github.com/rabiv-org/rabiv/internal/domain/evidence"
 )
+
+func TestCollectorEnvelopeSnapshotsReadableAtConsumerLimits(t *testing.T) {
+	// Real files and hashing, same-UID functional layout; not OS authorization.
+	captures, outputs := fixture(t), fixture(t)
+	ctx := context.Background()
+	at := time.Now().UTC()
+	id := strings.Repeat("a", 64)
+	job := build.Context{Identity: build.Identity{Provider: build.GitLab, Instance: "https://ci.example", ProjectID: "6", JobID: "12"}, PipelineID: "91", Source: &build.SourceRevision{RepositoryURI: "https://ci.example/project", CommitSHA: strings.Repeat("b", 40)}}
+	c := correlate.Capture{Version: "runtime-capture/v1", CaptureID: "capture", HostID: "host", BootID: "boot", Window: evidence.ObservationWindow{From: at, Until: at}, Containers: []correlate.Container{{ID: id, At: at, StartedAt: &at, JobID: "12", ProjectID: "6", RawRole: strings.Repeat("<", 10000)}}, Events: []correlate.Event{{Kind: correlate.ProcessExec, At: at, Source: "TETRAGON", ContainerID: id[:16], ExecID: "exec"}}, Gaps: []evidence.Gap{}, Diagnostics: []correlate.Diagnostic{}}
+	ref, err := collect.StoreCapture(ctx, captures, c, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestRef, err := collect.Produce(ctx, captures, outputs, ref, []build.Context{job}, job.Identity, "workflow", "manifest", at, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestBytes, err := outputs.Get(ctx, manifestRef, correlate.MaxManifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := v1.DecodeEvidenceManifest(manifestBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := outputs.Get(ctx, m.Payload.Reference, correlate.MaxEvidenceBytes)
+	if err != nil || acquire.Hash(content) != m.Payload.Reference.Digest || m.Payload.Coverage.Status != evidence.CoverageUnknown {
+		t.Fatalf("consumer limits/integrity mismatch: %v", err)
+	}
+	if _, err := outputs.Get(ctx, m.Payload.Reference, int64(len(content))-1); err == nil {
+		t.Fatal("consumer byte limit bypassed")
+	}
+}
 
 // Functional tests exercise real files with the same UID. They intentionally do
 // not use production OpenWriter or claim cross-UID Linux authorization evidence.

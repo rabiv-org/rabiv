@@ -3,7 +3,6 @@ package collect
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"sync"
@@ -104,11 +103,16 @@ func Capture(parent context.Context, c CaptureConfig, docker Docker, runtime Run
 	s := captureState{
 		config:   c,
 		snapshot: correlate.Capture{Version: "runtime-capture/v1", CaptureID: c.ID, HostID: c.HostID, BootID: c.BootID, Window: evidence.ObservationWindow{From: start, Until: start}, Containers: []correlate.Container{}, Events: []correlate.Event{}, Gaps: []evidence.Gap{}, Diagnostics: []correlate.Diagnostic{}},
-		counts:   map[string]uint64{}, gaps: map[evidence.GapCode]bool{}, usedBytes: 4096,
+		counts:   map[string]uint64{}, gaps: map[evidence.GapCode]bool{},
 	}
-	if c.Duration <= 0 || c.Duration > time.Hour || c.InventoryInterval <= 0 || c.MaxBytes < 4096 || c.MaxBytes > acquire.MaxObjectBytes || c.MaxRecords <= 0 || artifact.ValidateID(c.ID) != nil || s.snapshot.Validate() != nil {
+	if c.Duration <= 0 || c.Duration > time.Hour || c.InventoryInterval <= 0 || correlate.CheckCaptureLimits(c.MaxBytes, c.MaxRecords) != nil || artifact.ValidateID(c.ID) != nil || s.snapshot.Validate() != nil {
 		return s.snapshot, errors.New("invalid capture configuration")
 	}
+	budget, err := correlate.NewCaptureBudget(c.HostID, c.BootID, c.MaxBytes, correlate.CaptureReserveBytes)
+	if err != nil {
+		return s.snapshot, err
+	}
+	s.budget = budget
 	ctx, cancel := context.WithTimeout(parent, c.Duration)
 	defer cancel()
 	lifecycle, err := docker.Events(ctx)
@@ -147,14 +151,14 @@ func Capture(parent context.Context, c CaptureConfig, docker Docker, runtime Run
 // captureState is owned by the receiving goroutine. Stream pumps only deliver
 // messages; budgets, readiness and evidence are updated in one place.
 type captureState struct {
-	config    CaptureConfig
-	snapshot  correlate.Capture
-	counts    map[string]uint64
-	gaps      map[evidence.GapCode]bool
-	usedBytes int64
-	records   int
-	ready     bool
-	limit     bool
+	config   CaptureConfig
+	snapshot correlate.Capture
+	counts   map[string]uint64
+	gaps     map[evidence.GapCode]bool
+	budget   *correlate.CaptureBudget
+	records  int
+	ready    bool
+	limit    bool
 }
 
 // observe serializes evidence updates and permits only one outstanding inventory
@@ -252,8 +256,7 @@ func (s *captureState) interrupt(code string) {
 // accept charges valid records and failed reads to the same work budget. Only
 // an actual received record can establish a locally dropped-record count.
 func (s *captureState) accept(v any, recordReceived bool) bool {
-	b, err := json.Marshal(v)
-	if err != nil || s.usedBytes+int64(len(b))+1 > s.config.MaxBytes || s.records >= s.config.MaxRecords {
+	if s.records >= s.config.MaxRecords || s.budget.Add(v) != nil {
 		s.limit = true
 		if recordReceived {
 			s.snapshot.Dropped++
@@ -261,9 +264,17 @@ func (s *captureState) accept(v any, recordReceived bool) bool {
 		s.interrupt("CAPTURE_LIMIT")
 		return false
 	}
-	s.usedBytes += int64(len(b)) + 1
 	s.records++
 	return true
+}
+
+// StoreCapture streams a live Capture result without a second full-size JSON
+// buffer. Capture owns incremental admission; the sink also bounds actual bytes.
+func StoreCapture(ctx context.Context, sink acquire.Sink, c correlate.Capture, limit int64) (artifact.ObjectReference, error) {
+	if limit <= 0 || limit > correlate.MaxCaptureBytes || c.Validate() != nil {
+		return artifact.ObjectReference{}, correlate.ErrEnvelope
+	}
+	return putObject(ctx, sink, c.CaptureID, limit, func(w io.Writer) error { return writeJSON(w, c) })
 }
 
 func (s *captureState) readFailure(code string) bool {

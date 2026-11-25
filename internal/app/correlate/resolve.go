@@ -61,9 +61,22 @@ func scopeID(c Capture, o Container) string {
 // next start, discovery time, Docker event time, or RestartCount. ExecID links
 // processes only within this host/boot snapshot; PIDs never supply identity.
 func Resolve(c Capture, targets []build.Context) (Result, error) {
+	if err := c.Validate(); err != nil {
+		return Result{}, err
+	}
+	if err := checkCaptureEnvelope(c, MaxCaptureBytes); err != nil {
+		return Result{}, err
+	}
+	return resolve(c, targets)
+}
+
+func resolve(c Capture, targets []build.Context) (Result, error) {
 	r := Result{Scopes: []Scope{}, Events: make([]AttributedEvent, 0, len(c.Events)), Gaps: []evidence.Gap{}, Diagnostics: []Diagnostic{}}
-	if c.Validate() != nil || len(targets) == 0 {
+	if len(targets) == 0 {
 		return r, errors.New("invalid correlation inputs")
+	}
+	if err := checkTargetsEnvelope(targets); err != nil {
+		return r, err
 	}
 	identities := map[build.Identity]bool{}
 	for _, t := range targets {
