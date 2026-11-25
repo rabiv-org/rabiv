@@ -128,10 +128,15 @@ func init() {
 				os.Exit(1)
 			}
 		}
-		if json.NewEncoder(os.Stdout).Encode(ok) != nil {
+		data, err := json.Marshal(ok)
+		ready := filepath.Join(p.Workspace, "probe-ready")
+		if err != nil || os.WriteFile(ready+".pending", data, 0600) != nil || os.Rename(ready+".pending", ready) != nil {
 			os.Exit(1)
 		}
-		os.Exit(0)
+		// Keep the verified unit live so the owner-run test can cancel the
+		// actual launcher and exercise systemd cleanup.
+		time.Sleep(5 * time.Minute)
+		os.Exit(1)
 	}
 }
 
@@ -370,8 +375,16 @@ func TestVMPhase3(t *testing.T) {
 		t.Fatal(e)
 	}
 	decisions := filepath.Join(root, "decision-sentinel")
-	if e = os.Mkdir(decisions, 0755); e != nil {
+	if e = os.Mkdir(decisions, 0700); e != nil {
 		t.Fatal(e)
+	}
+	if e = os.Chown(decisions, wa.UID, wa.GID); e != nil {
+		t.Fatal(e)
+	}
+	// The same UID must be able to write this exact path outside the
+	// transient unit, so DAC alone cannot satisfy its denial assertion.
+	if _, e = actor("worker", false, "/usr/bin/touch", []string{filepath.Join(decisions, "forged")}, nil); e != nil {
+		t.Fatal("decision sentinel must be writable outside the sandbox", e)
 	}
 	var resultCfg input.Config
 	data, e = os.ReadFile(c.Channels["worker_finalizer"])
@@ -391,10 +404,7 @@ func TestVMPhase3(t *testing.T) {
 	if e = os.WriteFile(profile, data, 0444); e != nil {
 		t.Fatal(e)
 	}
-	probe, e := launchVMLab(context.Background(), bundle, "probe", profile, []string{})
-	if e != nil {
-		t.Fatal("actual worker OS probe failed", e)
-	}
+	probe := runCancelableProbe(t, bundle, profile, workspace)
 	t.Log("worker enforcement:", string(probe))
 	// Execute the real production Worker and Finalizer with a reviewed ELF input.
 	elf, e := os.ReadFile(c.Ingestor)
@@ -474,5 +484,38 @@ func TestVMPhase3(t *testing.T) {
 	}
 	if _, e = helper("verifier", "ingestor_verifier", "get", "", mr.ID+"@"+mr.Digest.Value, nil, false); e != nil {
 		t.Fatal("Verifier cannot read final manifest", e)
+	}
+}
+
+func runCancelableProbe(t *testing.T, bundle, profile, workspace string) []byte {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := launchVMLab(ctx, bundle, "probe", profile, nil)
+		done <- err
+	}()
+	poll := time.NewTicker(20 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		select {
+		case err := <-done:
+			t.Fatal("namespace probe ended before readiness", err)
+		case <-ctx.Done():
+			t.Fatal("namespace probe did not become ready", <-done)
+		case <-poll.C:
+			p, err := os.ReadFile(filepath.Join(workspace, "probe-ready"))
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			cancel()
+			launchErr := <-done
+			if err != nil || !errors.Is(launchErr, context.Canceled) || errors.Is(launchErr, worker.ErrCleanupUncertain) {
+				t.Fatalf("probe or production cancellation cleanup failed: %v / %v", err, launchErr)
+			}
+			t.Log("production launcher cancelled and stopped its owned unit")
+			return p
+		}
 	}
 }

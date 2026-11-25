@@ -19,6 +19,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/rabiv-org/rabiv/internal/app/acquire"
@@ -50,7 +51,8 @@ type Config struct {
 }
 
 func canonical(p string) bool {
-	return filepath.IsAbs(p) && filepath.Clean(p) == p && p != "/" && !strings.ContainsAny(p, " \t\r\n:%$")
+	return filepath.IsAbs(p) && filepath.Clean(p) == p && p != "/" && utf8.ValidString(p) &&
+		!strings.ContainsAny(p, " :%$\\\"'") && strings.IndexFunc(p, unicode.IsControl) == -1
 }
 func within(a, b string) bool { return a == b || strings.HasPrefix(a, b+"/") }
 func (c Config) Validate() error {
@@ -129,14 +131,9 @@ func Load(path string) (Config, error) {
 
 // Arguments describes the exact profile for an owner-controlled transient unit.
 // Unit configuration is implemented here; actual enforcement requires VM tests.
-func (c Config) Arguments(profile, unit string, args []string) ([]string, error) {
-	if c.Validate() != nil || !canonical(profile) || !strings.HasPrefix(unit, "rabiv-worker-") || strings.ContainsAny(unit, " /\t\n") {
+func (c Config) Arguments(profile, unit string) ([]string, error) {
+	if c.Validate() != nil || !c.profileVisible(profile) || !strings.HasPrefix(unit, "rabiv-worker-") || strings.ContainsAny(unit, " /\t\n") {
 		return nil, ErrIsolation
-	}
-	for _, arg := range args {
-		if !utf8.ValidString(arg) || strings.ContainsRune(arg, 0) || arg == "--profile" || arg == "-profile" || strings.HasPrefix(arg, "--profile=") || strings.HasPrefix(arg, "-profile=") {
-			return nil, ErrIsolation
-		}
 	}
 	var inaccessible []string
 	for _, path := range append([]string{c.DecisionRoot}, c.CredentialPaths...) {
@@ -166,8 +163,24 @@ func (c Config) Arguments(profile, unit string, args []string) ([]string, error)
 	for _, p := range props {
 		out = append(out, "--property="+p)
 	}
-	out = append(out, "--", c.Executable, "worker", "--profile", profile)
-	return append(out, args...), nil
+	return append(out, "--", c.Executable, "worker", "--profile", profile, "--request-stdin"), nil
+}
+
+func (c Config) profileVisible(profile string) bool {
+	if !canonical(profile) {
+		return false
+	}
+	for _, root := range []string{"/home", "/root", "/run", "/var/run", "/tmp", "/var/tmp", "/dev", "/proc", "/sys"} {
+		if within(profile, root) {
+			return false
+		}
+	}
+	for _, denied := range append([]string{c.DecisionRoot}, c.CredentialPaths...) {
+		if within(profile, denied) {
+			return false
+		}
+	}
+	return true
 }
 
 func netNS() (uint64, error) {
@@ -278,6 +291,12 @@ func (c Config) Check() error {
 // Launch requires explicit owner execution as root and reviewed root-owned
 // binaries. It never invokes sudo, changes users/groups or installs a service.
 func Launch(ctx context.Context, profile string, args []string) ([]byte, error) {
+	unit := "rabiv-worker-" + strings.ToLower(rand.Text())
+	marker := "rabiv-launch-" + strings.ToLower(rand.Text())
+	return launch(ctx, profile, args, unit, marker)
+}
+
+func launch(ctx context.Context, profile string, args []string, unit, marker string) ([]byte, error) {
 	if os.Getuid() != 0 || os.Geteuid() != 0 {
 		return nil, ErrIsolation
 	}
@@ -296,21 +315,21 @@ func Launch(ctx context.Context, profile string, args []string) ([]byte, error) 
 	if e != nil || ns != c.HostNetNS {
 		return nil, ErrIsolation
 	}
-	unit := "rabiv-worker-" + strings.ToLower(rand.Text())
-	// Validate the requested arguments, then pass them as opaque JSON over stdin.
-	// Subject names containing dollars/percent signs must not undergo systemd
-	// ExecStart environment/specifier expansion or shell interpretation.
-	if _, e = c.Arguments(profile, unit, args); e != nil {
-		return nil, e
+	for _, arg := range args {
+		if !utf8.ValidString(arg) || strings.ContainsRune(arg, 0) {
+			return nil, ErrIsolation
+		}
 	}
+	// The profile and all systemd properties are outside the opaque JSON request.
 	request, e := json.Marshal(args)
 	if e != nil || len(request) > 256<<10 {
 		return nil, ErrIsolation
 	}
-	argv, e := c.Arguments(profile, unit, []string{"--request-stdin"})
+	argv, e := c.Arguments(profile, unit)
 	if e != nil {
 		return nil, e
 	}
+	argv = append([]string{"--property=SyslogIdentifier=" + marker}, argv...)
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(c.TimeoutSeconds+15)*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/usr/bin/systemd-run", argv...)
@@ -322,15 +341,18 @@ func Launch(ctx context.Context, profile string, args []string) ([]byte, error) 
 	cmd.WaitDelay = 5 * time.Second
 	e = cmd.Run()
 	if e != nil {
-		// On cancellation, stop only a unit whose description matches our random
-		// invocation. Never stop a pre-existing unit merely by name collision.
+		if cmd.Process == nil {
+			return nil, fmt.Errorf("%w: systemd client did not start", ErrIsolation)
+		}
 		cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		show := exec.CommandContext(cleanup, "/usr/bin/systemctl", "show", "--property=Description", "--value", unit)
-		if b, err := show.Output(); err == nil && strings.TrimSpace(string(b)) == unit {
-			_ = exec.CommandContext(cleanup, "/usr/bin/systemctl", "stop", unit).Run()
+		if err := recoverLaunch(cleanup, systemctl, unit, marker); err != nil {
+			return nil, fmt.Errorf("%w: worker exited without acknowledgement; %w", ErrIsolation, err)
 		}
-		return nil, ErrIsolation
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("%w: owned unit stopped: %w", ErrIsolation, ctx.Err())
+		}
+		return nil, fmt.Errorf("%w: worker exited without acknowledgement; owned unit stopped", ErrIsolation)
 	}
 	return bytes.Clone(stdout.buf.Bytes()), nil
 }

@@ -13,7 +13,7 @@ func profile() Config {
 
 func TestProfileProperties(t *testing.T) {
 	c := profile()
-	args, err := c.Arguments("/etc/example/worker.json", "rabiv-worker-example", []string{"--id", "test"})
+	args, err := c.Arguments("/etc/example/worker.json", "rabiv-worker-example")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +31,7 @@ func TestProfileProperties(t *testing.T) {
 func TestPathsUnderRunAreMaskedByOverlay(t *testing.T) {
 	c := profile()
 	c.CredentialPaths = append(c.CredentialPaths, "/run/rabiv/credential", "/var/run/rabiv/credential")
-	args, err := c.Arguments("/etc/example/worker.json", "rabiv-worker-example", nil)
+	args, err := c.Arguments("/etc/example/worker.json", "rabiv-worker-example")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,6 +43,22 @@ func TestPathsUnderRunAreMaskedByOverlay(t *testing.T) {
 	c.Workspace = "/var/run/rabiv/work"
 	if err := c.Validate(); !errors.Is(err, ErrIsolation) {
 		t.Fatalf("workspace accepted under /var/run: %v", err)
+	}
+}
+
+func TestUnitRejectsHiddenProfileAndSystemdListSyntax(t *testing.T) {
+	c := profile()
+	for _, path := range []string{"/home/example/profile.json", "/run/worker.json", "/tmp/example.json", "/var/tmp/example.json", "/etc/example/credentials/worker.json", "/var/lib/example/decisions/profile.json"} {
+		if _, err := c.Arguments(path, "rabiv-worker-example"); !errors.Is(err, ErrIsolation) {
+			t.Fatalf("profile unavailable in sandbox was accepted: %s", path)
+		}
+	}
+	for _, path := range []string{`/var/lib/example/a"b`, `/var/lib/example/a'b`, `/var/lib/example/a\b`} {
+		unsafe := c
+		unsafe.FetchRoot = path
+		if unsafe.Validate() == nil {
+			t.Fatalf("systemd list syntax accepted: %s", path)
+		}
 	}
 }
 

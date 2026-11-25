@@ -27,8 +27,9 @@ Each root-owned channel JSON file has these exact fields:
 
 The layout is `staging` 0700 Writer:primary and `committed` 2750 Writer:reader;
 final files are 0440 Writer:reader. Staging/committed share a local filesystem.
-Configuration ancestors are root-owned and not writable by other users; parent
-configuration directory is root:root 0755. No extra/default ACLs are supported.
+Configuration directories and ancestors are root-owned and not writable by group
+or other users. The channel root itself requires root:root 0755. No extra/default
+ACLs are supported.
 
 Fetch has only its three reader groups, Collector its two source groups and
 output reader group, Finalizer its two input groups and output reader group.
@@ -70,6 +71,9 @@ source metadata. It downloads opaque bytes without ZIP parsing/scanning. Metadat
 and artifact failures remain distinct; Collector's metadata-only record explicitly
 sets `artifacts_requested=false`. Artifact-bearing snapshots set it true and
 carry either an archive reference or a sanitized failure code.
+The Fetch `--timeout` covers project metadata, job metadata and the complete
+artifact download together. Publication of the resulting snapshots uses the
+invocation's original context.
 
 Artifact redirects require HTTPS, certificate validation and exact administrator
 `--artifact-origin` allowlists (no wildcard/suffix match), at most three redirects.
@@ -109,6 +113,9 @@ its stored `interrupted` flag remains true and processing emits a FAILED manifes
 `--capture-ref`, repeated `--job-ref` metadata snapshot references, target fetched
 snapshot `--target`, `--workflow-id` and manifest `--id`. It writes an evidence
 object and strict v1 EvidenceManifest. Fetched CI metadata failure produces FAILED.
+The capture byte limit applies only to the input snapshot. Correlation can expand
+the result, so the evidence object is streamed against the input store's 1 GiB
+object ceiling. If it exceeds that ceiling there is no manifest acknowledgement.
 
 `rabiv-ingestor worker-run --profile ROOT_OWNED_PROFILE [worker arguments]` is an
 owner-controlled root launcher for a transient systemd unit. It launches only the
@@ -125,9 +132,16 @@ Profile JSON fields are `uid`, `gid`, `fetch_reader_gid`, `result_reader_gid`,
 paths and current host network-namespace inode from `/proc/self/ns/net`.
 Workspace is Worker-owned 0700 on private guest storage outside home/tmp/run.
 Credential/decision paths are denied; they cannot overlap allowed roots. Config
-paths reject whitespace/specifier characters for unambiguous systemd properties;
-this restriction does not apply to logical subject names. Profiles must be renewed
-after a host network-namespace identity change/reboot and reviewed before root use.
+paths reject control, quoting, escape and specifier characters used by systemd.
+The profile must be visible after the unit applies its mounts. Logical subject
+names remain opaque values in the stdin request. Profiles must be renewed after a
+host network-namespace identity change and reviewed before root use.
+
+After a failed or interrupted launch the launcher checks for a late unit for up
+to ten seconds. It requires a per-launch ownership marker and rechecks the
+systemd invocation ID before stopping. An unresolved lookup or failed stop yields
+a sanitized cleanup-unconfirmed error. A unit that starts after the lookup
+window remains subject to its configured runtime limit.
 
 The Worker application validates its snapshot ID/reference, exact nonempty unique
 subject selection and positive byte limits before I/O. Byte limits cannot exceed
@@ -139,7 +153,9 @@ An archive parser or scanner can still report an explicit production failure.
 ZIP defaults: 32 MiB transport, 16 MiB/entry, 48 MiB declared expanded total,
 1,024 entries, compression ratio 100. All entries are checked for duplicate names,
 unsafe paths, links/special files, unsupported encoding/encryption and limits.
-Selected entries undergo bounded decompression/CRC validation. Unselected payload
+The standard library can allocate directory metadata before the entry-count
+check. The transport limit and the Worker's memory, CPU and runtime limits bound
+that exposure. Selected entries undergo bounded decompression/CRC validation. Unselected payload
 CRCs are not evaluated. Selection preserves exact UTF-8 logical names; it does not
 normalize them. Supplied SBOM/provenance bytes are stored independently.
 
@@ -150,9 +166,13 @@ projection and SHA-256 binding. Package count does not establish coverage.
 
 `rabiv-ingestor finalize` requires Finalizer Fetch/Worker/output channel configs,
 `--job-ref`, optional `--worker-ref`, `--workflow-id`, manifest `--id`, `--group-id`
-and repeated exact `--subject`. An absent `--worker-ref` produces FAILED with
-INPUT_UNAVAILABLE; a supplied valid WorkerResult carrying a producer failure also
-produces FAILED. A supplied reference whose object is missing/unreadable/corrupt,
+and repeated exact `--subject`. `--max-entry` must match the expanded subject
+limit used by Worker and is independent of `--max-archive`. An absent
+`--worker-ref` produces FAILED with INPUT_UNAVAILABLE. An explicitly empty
+reference is invalid. A valid WorkerResult carrying a producer failure produces
+FAILED after the exact requested subject set is bound. Results produced before
+`acquisition-worker/v2` lack that required selection. Regenerate them with the
+current Worker and a new result ID. A supplied reference whose object is missing/unreadable/corrupt,
 invalid WorkerResult JSON or wrong job/archive/subject binding returns an error
 without an ArtifactManifest ACK. These errors do not become producer failures.
 Byte objects are rehashed/copied into Ingestor storage before a strict
@@ -165,13 +185,15 @@ orphan cleanup/recovery is deferred.
 Runtime normalization supports process_exec, process_exit and the explicit
 security_file_permission/MAY_WRITE and tcp_connect profiles. Other events remain
 unsupported; this is not generic file/network coverage. Source loss reports retain
-counts; reported zero does not establish zero loss over a capture. Throttle events
-preserve observation gaps. Overall coverage remains UNKNOWN. Known local drops are
+counts; reported zero does not establish zero loss over a capture. Positive source
+loss reports and throttle events expose capture-wide observation gaps. Overall
+coverage remains UNKNOWN. Known local drops are
 reported separately; overlapping source reports are not falsely summed as a total.
 When both local and source reports exist, the v1 EventLoss summary keeps
 LOSS_REPORTED with no purported total Count. The local count remains in the
 referenced capture's `dropped` field and source reports remain in its events and
-the evidence object's normalized result. A consumer needing those counts must
+the evidence object's normalized result. The result also has a separate
+`LOCAL_CAPTURE_DROPPED_RECORDS` diagnostic when applicable. A consumer needing those counts must
 resolve and hash-check those references.
 
 Gap summaries are capture-wide and conservative. Job manifests retain shared and
@@ -293,10 +315,11 @@ and two units. Reports/journal are root-private from creation. Cancellation and
 an eight-minute work deadline lead to separate bounded recovery before the Go
 suite's ten-minute fallback. SIGKILL/VM failure still need manual recovery.
 
-The new test-only unit launcher reuses production profile arguments and runs the
-production Worker/Finalizer, but does not use `worker.Launch` cancellation cleanup.
-That production description-only unit guard remains unchanged under the approved
-harness-only scope; these VM results must not be claimed to verify that branch.
+The opt-in bundle uses a journaled test reservation to exercise the production
+launcher implementation. The namespace probe becomes ready before the test
+cancels it and checks the owned-unit cleanup outcome. The second unit runs the
+production Worker and the suite then checks the Finalizer. An absent or skipped
+`TestVMPhase3` fails acceptance even when the test binary exits zero.
 
 Phase 3 acceptance still requires owner review, actual privileged VM enforcement
 results and applicable real-input adapter evidence. No production readiness,

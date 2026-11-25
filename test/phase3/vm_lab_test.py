@@ -40,6 +40,33 @@ class LabTests(unittest.TestCase):
                       "identities": [], "baseline_uids": [], "units": {"probe": self.unit}}
         self.calls = []
 
+    def test_acceptance_requires_intended_test_marker_and_pass(self):
+        report = self.control / "report.txt"
+        run = b"=== RUN   TestVMPhase3\n"
+        passed = b"--- PASS: TestVMPhase3 (0.02s)\n"
+        for output, expected in (
+            (run + passed + b"PASS\n", True),
+            (b"testing: warning: no tests to run\nPASS\n", False),
+            (run + b"--- SKIP: TestVMPhase3 (0.00s)\nPASS\n", False),
+            (run + b"--- FAIL: TestVMPhase3 (0.00s)\nFAIL\n", False),
+            (passed + b"PASS\n", False),
+            (run + passed + b"FAIL\n", False),
+        ):
+            report.write_bytes(output)
+            self.assertEqual(expected, lab.passed_vm_test(report), output)
+
+    def test_recovery_lock_retry_is_bounded(self):
+        with patch.object(lab.fcntl, "flock", side_effect=(BlockingIOError(), None)) as attempt, \
+             patch.object(lab.time, "monotonic", side_effect=(0, 0.1)), patch.object(lab.time, "sleep") as wait:
+            lab.acquire_lock(17, 5)
+            self.assertEqual(2, attempt.call_count)
+            wait.assert_called_once_with(0.05)
+        with patch.object(lab.fcntl, "flock", side_effect=BlockingIOError()) as attempt, \
+             patch.object(lab.time, "monotonic", side_effect=(0, 5)):
+            with self.assertRaisesRegex(lab.LabError, "recovery incomplete"):
+                lab.acquire_lock(17, 5)
+            self.assertEqual(1, attempt.call_count)
+
     def properties(self, nonce=None, invocation=None):
         return result("LoadState=loaded\nActiveState=active\nInvocationID=" +
                       (invocation or "c"*32) + "\nSyslogIdentifier=rabiv-vm-" + (nonce or "b"*64) + "\n")
@@ -92,7 +119,7 @@ class LabTests(unittest.TestCase):
             return self.properties(nonce="d"*64)
         with patch.object(lab, "locked", return_value=contextlib.nullcontext(self.state)), patch.object(lab, "command", command):
             with self.assertRaises(lab.LabError):
-                lab.launch_unit(self.control, "probe", {})
+                lab.reserve_unit(self.control, "probe")
         self.assertEqual("rejected", self.unit["status"])
         lab.Lab(self.control, self.state, command).stop_unit(self.unit)
         self.assertFalse(any("stop" in args or "systemd-run" in args for args in self.calls))
@@ -187,10 +214,10 @@ class LabTests(unittest.TestCase):
             with self.subTest(outcome=str(outcome)), tempfile.TemporaryDirectory() as directory:
                 base = Path(directory) / "lab"
                 fake = SimpleNamespace(returncode=0)
-                with patch.object(lab, "BASE", base), patch.object(lab, "trusted"), patch.object(lab, "verify_acl"), patch.object(lab, "begin_recovery"), patch.object(lab, "baseline_uids", return_value=[]), \
+                with patch.object(lab, "BASE", base), patch.object(lab, "trusted"), patch.object(lab, "verify_acl"), patch.object(lab, "baseline_uids", return_value=[]), \
                      patch.object(lab, "provision", side_effect=outcome if isinstance(outcome, Exception) else None), \
                      patch.object(lab.subprocess, "Popen"), patch.object(lab, "wait_child", return_value=outcome), \
-                     patch.object(lab, "run_recovery", return_value=0) as recover:
+                     patch.object(lab, "passed_vm_test", return_value=True), patch.object(lab, "run_recovery", return_value=0) as recover:
                     if isinstance(outcome, Exception):
                         with self.assertRaises(lab.LabError):
                             lab.run_lab(Path(directory), "/test/syft")
@@ -227,7 +254,7 @@ class LabTests(unittest.TestCase):
                     timer.start()
                     return child
                 with patch.object(lab, "BASE", base), patch.object(lab, "trusted"), patch.object(lab, "verify_acl"), \
-                     patch.object(lab, "begin_recovery"), patch.object(lab, "baseline_uids", return_value=[]), \
+                     patch.object(lab, "baseline_uids", return_value=[]), \
                      patch.object(lab, "provision"), patch.object(lab.subprocess, "Popen", side_effect=start), \
                      patch.object(lab, "run_recovery", return_value=0) as recover:
                     self.assertEqual(128+signum, lab.run_lab(Path(directory), "/fixture/syft"))

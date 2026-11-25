@@ -11,12 +11,12 @@ no dependencies. Recovery does not require Syft or account-creation tools.
 ## Scope and evidence boundary
 
 The lab creates six nonlogin accounts, thirteen groups, seven directed channels
-and at most two transient units. It uses the production `worker.Config.Arguments`,
-Worker preflight/processing and Finalizer. Its test-only launcher owns the units.
-It does **not** use or verify the production `worker.Launch` error-cleanup branch;
-the description-only guard in that production function remains unchanged under
-the harness-only remediation boundary. Do not interpret this VM run as acceptance
-of that production cancellation/collision behavior.
+and at most two transient units. The supervisor records both unit reservations
+before they are used. The opt-in test entry point supplies those reservations
+to the shared implementation of `worker.Launch`. The first unit checks the OS
+profile and is canceled after it signals readiness. The second runs the reviewed
+production Ingestor Worker and supplies the result to Finalizer. The controlled
+cancellation does not prove behavior for every timing of a delayed systemd start.
 
 Unit properties remain RuntimeMaxSec=180, TimeoutStopSec=5s, MemoryMax=2 GiB,
 MemorySwapMax=0, CPUQuota=100%, TasksMax=64 and KillMode=control-group. Actual
@@ -26,10 +26,12 @@ The external supervisor allows eight minutes for provisioning/testing, then
 terminates only its own child session (10 seconds TERM grace, then KILL). It
 keeps the unreaped session leader PID reserved until descendants are stopped.
 Recovery has a separate 75-second work deadline and its own held process group
-with TERM/KILL grace. The Go ten-minute alarm is a final
+with TERM/KILL grace. The recovery process retries a busy journal lock for up to
+five seconds within that deadline. The Go ten-minute alarm is a final
 fallback, not the cleanup mechanism. SIGINT, SIGTERM, SIGHUP and the supervisor
 deadline request the same bounded recovery path. Slow/stuck kernel operations,
 SIGKILL of the supervisor and VM/power failure cannot guarantee automatic cleanup.
+Acceptance requires a zero test process exit and an actual `TestVMPhase3` PASS.
 
 ## State, ownership and privacy
 

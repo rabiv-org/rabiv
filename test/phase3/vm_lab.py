@@ -32,6 +32,10 @@ class LabError(Exception):
     pass
 
 
+class JournalBusy(LabError):
+    pass
+
+
 def command(args, timeout=10):
     return subprocess.run(args, env=ENV, capture_output=True, text=True,
                           timeout=timeout, check=False)
@@ -100,7 +104,7 @@ def validate_state(state):
 
 
 @contextlib.contextmanager
-def locked(control):
+def locked(control, wait=0):
     trusted(control, directory=True, private=True)
     if control.parent != BASE or not control.name.startswith("control."):
         raise LabError("not a Phase 3 control directory")
@@ -109,13 +113,26 @@ def locked(control):
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o600:
             raise LabError("invalid recovery lock")
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        acquire_lock(fd, wait)
         trusted(control / "state.json", private=True)
         state = json.loads((control / "state.json").read_text())
         validate_state(state)
         yield state
     finally:
         os.close(fd)
+
+
+def acquire_lock(fd, wait):
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError as err:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise JournalBusy("journal lock still busy; recovery incomplete") from err
+            time.sleep(min(0.05, remaining))
 
 
 class Lab:
@@ -290,12 +307,6 @@ def process_start(pid):
         return None
 
 
-def begin_recovery(control):
-    with locked(control) as state:
-        state["recovery_ready"] = True
-        save(control, state)
-
-
 def verify_acl(root):
     result = command(["getfacl", "-cp", str(root)])
     if result.returncode != 0 or len([line for line in result.stdout.splitlines() if line.strip()]) != 3:
@@ -307,6 +318,11 @@ def provision(lab, bundle, syft, cancelled):
     root = Path(state["root"])
     config = {"Root": str(root), "Binary": str(root / "acquisition.test"),
               "Ingestor": str(root / "rabiv-ingestor"), "Syft": syft, "Actors": {}, "Channels": {}}
+    configs = root / "channel-config"
+    configs.mkdir(mode=0o700)
+    # Consumers can traverse to their config. Only the actual channel root
+    # needs mode 0755.
+    configs.chmod(0o751)
     for name in ("acquisition.test", "rabiv-ingestor"):
         fd = os.open(root / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o555)
         with os.fdopen(fd, "wb") as f:
@@ -339,7 +355,7 @@ def provision(lab, bundle, syft, cancelled):
             os.chmod(path, mode)
         channel = {"root_dir": str(directory), "writer_uid": w["UID"], "writer_gid": w["GID"],
                    "reader_uid": r["UID"], "reader_primary_gid": r["GID"], "reader_gid": gid}
-        path = root / (key + ".json")
+        path = configs / (key + ".json")
         private_json(path, channel, 0o444)
         config["Channels"][key] = str(path)
     private_json(root / "vm.json", config, 0o444)
@@ -376,6 +392,20 @@ def wait_child(child, cancelled, seconds):
         pass
     actual = child.wait(timeout=5)
     return actual if result is None else result
+
+
+def passed_vm_test(report):
+    with report.open("rb") as f:
+        data = f.read((1 << 20) + 1)
+    if len(data) > 1 << 20:
+        return False
+    lines = data.splitlines()
+    started = [i for i, line in enumerate(lines) if line == b"=== RUN   TestVMPhase3"]
+    passed = [i for i, line in enumerate(lines)
+              if re.fullmatch(rb"--- PASS: TestVMPhase3 \([0-9.]+s\)", line)]
+    if len(started) != 1 or len(passed) != 1 or started[0] >= passed[0]:
+        return False
+    return lines[-1] == b"PASS" and not any(line.startswith((b"--- SKIP: ", b"--- FAIL: ")) for line in lines)
 
 
 def run_lab(bundle, syft):
@@ -420,6 +450,10 @@ def run_lab(bundle, syft):
             child = subprocess.Popen([str(bundle / "acquisition.test"), "-test.v", "-test.timeout=10m", "-test.run=^TestVMPhase3$"],
                                      env=env, stdout=report, stderr=subprocess.STDOUT, start_new_session=True)
             result = wait_child(child, lambda: cancelled[0], max(0, deadline-time.monotonic()))
+        if result == 0 and not passed_vm_test(control / "report.txt"):
+            result = 1
+            with (control / "report.txt").open("ab") as report:
+                report.write(b"VM acceptance failed: TestVMPhase3 PASS was not established\n")
     finally:
         # Independent recovery process survives test panic/timeout. A hard kill of
         # THIS supervisor still requires the explicit, private-journal recovery.
@@ -428,7 +462,6 @@ def run_lab(bundle, syft):
         for s in previous:
             signal.signal(s, signal.SIG_IGN)
         try:
-            begin_recovery(control)
             if run_recovery(bundle, control) != 0:
                 result = 1
         finally:
@@ -441,13 +474,13 @@ def run_recovery(bundle, control):
     # The cleanup process gets its own held session too. A stalled cleanup
     # command must not survive just because only its Python parent was killed.
     with open(control / "report.txt", "ab") as report:
-        child = subprocess.Popen(["/usr/bin/python3", "-B", str(bundle / "vm_lab.py"), "recover", str(control)],
+        child = subprocess.Popen(["/usr/bin/python3", "-B", str(bundle / "vm_lab.py"), "recover-after-test", str(control)],
                                  env=ENV, stdin=subprocess.DEVNULL, stdout=report,
                                  stderr=subprocess.STDOUT, start_new_session=True)
         return wait_child(child, lambda: 0, 75)
 
 
-def launch_unit(control, slot, payload):
+def reserve_unit(control, slot):
     if slot not in ("probe", "worker"):
         raise LabError("invalid unit slot")
     with locked(control) as state:
@@ -459,30 +492,25 @@ def launch_unit(control, slot, payload):
             unit["status"] = "rejected"
             lab.persist()
             raise LabError("pre-existing unit; no start/stop attempted")
-        argv = payload["argv"]
-        if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv) or argv.count("--unit=" + unit["name"]) != 1:
-            raise LabError("unit argument binding mismatch")
-        if "--property=RuntimeMaxSec=180" not in argv or "--property=MemoryMax=2147483648" not in argv or "--property=CPUQuota=100%" not in argv or "--property=TasksMax=64" not in argv:
-            raise LabError("lab unit limits changed")
-        request = json.dumps(payload["request"]).encode()
-        if len(request) > 256 << 10:
-            raise LabError("worker request too large")
-        argv.insert(argv.index("--"), "--property=SyslogIdentifier=rabiv-vm-" + unit["nonce"])
         unit["status"] = "pending"
         lab.persist()
-        try:
-            with tempfile.TemporaryFile(dir=control) as src, tempfile.TemporaryFile(dir=control) as output:
-                src.write(request)
-                src.seek(0)
-                result = subprocess.run(["/usr/bin/systemd-run", *argv], stdin=src, stdout=output,
-                                        stderr=subprocess.DEVNULL, env=ENV, timeout=195, check=False)
-                output.seek(0)
-                data = output.read((1 << 20) + 1)
-                if result.returncode != 0 or len(data) > 1 << 20:
-                    raise LabError("lab unit failed or output exceeded bound")
-                sys.stdout.buffer.write(data)
-        finally:
-            lab.stop_unit(unit)
+        return {"name": unit["name"], "nonce": unit["nonce"]}
+
+
+def recover(control, supervised):
+    # Retry within the 75-second recovery subprocess budget. A canceled
+    # descendant can still hold the descriptor while the kernel reaps it.
+    with locked(control, wait=5) as state:
+        supervisor = state["supervisor"]
+        active = process_start(supervisor["pid"]) == supervisor["start"]
+        if supervised:
+            if os.getppid() != supervisor["pid"] or not active:
+                raise LabError("recovery supervisor identity mismatch")
+            state["recovery_ready"] = True
+            save(control, state)
+        elif active and not state["recovery_ready"]:
+            raise LabError("supervisor is active; cancel it before recovery")
+        Lab(control, state).cleanup()
 
 
 def main(args):
@@ -498,7 +526,8 @@ def main(args):
         raise LabError("dedicated Ubuntu 24.04 KVM/guest ext4 required")
     if not Path("/sys/fs/cgroup/cgroup.controllers").is_file():
         raise LabError("cgroups v2 required")
-    tools = ("userdel", "groupdel", "systemctl", "getent", "pkill") if args and args[0] == "recover" else ("useradd", "userdel", "groupadd", "groupdel", "setpriv", "getfacl", "findmnt", "systemd-run", "systemctl", "getent", "pkill")
+    recovery = args and args[0] in ("recover", "recover-after-test")
+    tools = ("userdel", "groupdel", "systemctl", "getent", "pkill") if recovery else ("useradd", "userdel", "groupadd", "groupdel", "setpriv", "getfacl", "findmnt", "systemd-run", "systemctl", "getent", "pkill")
     for tool in tools:
         path = shutil.which(tool, path=ENV["PATH"])
         if path is None:
@@ -506,18 +535,11 @@ def main(args):
         trusted(Path(path).resolve())
     if len(args) == 3 and args[0] == "run":
         return run_lab(Path(args[1]), args[2])
-    if len(args) == 2 and args[0] == "recover":
-        with locked(Path(args[1])) as state:
-            supervisor = state["supervisor"]
-            if not state["recovery_ready"] and process_start(supervisor["pid"]) == supervisor["start"]:
-                raise LabError("supervisor is active; cancel it before recovery")
-            Lab(Path(args[1]), state).cleanup()
+    if len(args) == 2 and recovery:
+        recover(Path(args[1]), supervised=args[0] == "recover-after-test")
         return 0
-    if len(args) == 3 and args[0] == "unit":
-        data = sys.stdin.buffer.read((512 << 10) + 1)
-        if len(data) > 512 << 10:
-            raise LabError("unit envelope too large")
-        launch_unit(Path(args[1]), args[2], json.loads(data))
+    if len(args) == 3 and args[0] == "reserve-unit":
+        print(json.dumps(reserve_unit(Path(args[1]), args[2])))
         return 0
     raise LabError("invalid lab supervisor arguments")
 
