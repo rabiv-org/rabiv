@@ -1,0 +1,176 @@
+// Package tetragon normalizes bounded native JSON export records. The producer
+// remains an independent privileged service; this adapter installs no policies.
+package tetragon
+
+import (
+	"bufio"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/netip"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/rabiv-org/rabiv/internal/app/collect"
+	"github.com/rabiv-org/rabiv/internal/app/correlate"
+	"github.com/rabiv-org/rabiv/internal/domain/build"
+	"github.com/rabiv-org/rabiv/internal/platform/jsoninput"
+)
+
+var ErrRecord = errors.New("malformed or unsupported Tetragon record")
+
+// Stream reads an explicitly supplied export descriptor without accessing
+// privileged control sockets, installing policies or requesting credentials.
+type Stream struct {
+	reader  io.ReadCloser
+	scanner *bufio.Scanner
+	max     int64
+}
+
+func NewStream(r io.ReadCloser, maxRecord int64) (*Stream, error) {
+	if r == nil || maxRecord <= 0 || maxRecord > 16<<20 {
+		return nil, ErrRecord
+	}
+	s := bufio.NewScanner(r)
+	s.Buffer(make([]byte, min(4096, int(maxRecord))), int(maxRecord))
+	return &Stream{reader: r, scanner: s, max: maxRecord}, nil
+}
+func (s *Stream) Close() error { return s.reader.Close() }
+func (s *Stream) Next() (correlate.Event, error) {
+	if !s.scanner.Scan() {
+		if err := s.scanner.Err(); err != nil {
+			return correlate.Event{}, errors.Join(collect.ErrStreamRead, err)
+		}
+		return correlate.Event{}, io.EOF
+	}
+	return Normalize(s.scanner.Bytes(), s.max)
+}
+
+type process struct {
+	ExecID string `json:"exec_id"`
+	PID    uint32 `json:"pid"`
+	Binary string `json:"binary"`
+	Docker string `json:"docker"`
+}
+type event struct {
+	Process  process                      `json:"process"`
+	Parent   process                      `json:"parent"`
+	Function string                       `json:"function_name"`
+	Args     []map[string]json.RawMessage `json:"args"`
+}
+
+func probeArg(args map[string]json.RawMessage, kind string, out any) bool {
+	for name, value := range args {
+		if name != kind && strings.HasSuffix(name, "_arg") && string(value) != "null" {
+			return false
+		}
+	}
+	value := args[kind]
+	return string(value) != "null" && jsoninput.Decode(value, out, false) == nil
+}
+
+// Normalize supports process_exec/exit and the explicit security_file_permission
+// MAY_WRITE / tcp_connect profile. Argument type/order are checked, not a made-up
+// wire index. Unsupported event kinds remain explicit, without policy conclusions.
+func Normalize(data []byte, maxRecord int64) (correlate.Event, error) {
+	var zero correlate.Event
+	if maxRecord <= 0 || int64(len(data)) > maxRecord {
+		return zero, ErrRecord
+	}
+	var raw map[string]json.RawMessage
+	if jsoninput.Decode(data, &raw, false) != nil {
+		return zero, ErrRecord
+	}
+	var at time.Time
+	if json.Unmarshal(raw["time"], &at) != nil || build.ValidateTime(at) != nil {
+		return zero, ErrRecord
+	}
+	result := correlate.Event{At: at, Source: "TETRAGON", Kind: correlate.Unsupported}
+	selected := ""
+	for k, v := range raw {
+		if (strings.HasPrefix(k, "process_") || k == "rate_limit_info") && string(v) != "null" {
+			if selected != "" {
+				return zero, ErrRecord
+			}
+			selected = k
+		}
+	}
+	if selected == "" {
+		return result, nil
+	}
+	result.NativeKind = selected
+	if selected == "rate_limit_info" {
+		var loss struct {
+			Count json.Number `json:"number_of_dropped_process_events"`
+		}
+		if jsoninput.Decode(raw[selected], &loss, false) != nil {
+			return zero, ErrRecord
+		}
+		count, e := strconv.ParseUint(string(loss.Count), 10, 64)
+		if e != nil {
+			return zero, ErrRecord
+		}
+		result.Kind = correlate.SourceLoss
+		result.LossCount = &count
+		return result, nil
+	}
+	if selected != "process_exec" && selected != "process_exit" && selected != "process_kprobe" {
+		return result, nil
+	}
+	var e event
+	if jsoninput.Decode(raw[selected], &e, false) != nil {
+		return zero, ErrRecord
+	}
+	result.ContainerID = e.Process.Docker
+	result.ExecID = e.Process.ExecID
+	result.ParentExecID = e.Parent.ExecID
+	result.PID = e.Process.PID
+	result.Binary = e.Process.Binary
+	if result.ContainerID != "" && (build.ObservedContainerID{Runtime: "DOCKER", Value: result.ContainerID}).Validate() != nil {
+		return zero, ErrRecord
+	}
+	if result.ExecID == "" || len(result.ExecID) > correlate.MaxExecIDBytes || len(result.ParentExecID) > correlate.MaxExecIDBytes {
+		return zero, ErrRecord
+	}
+	switch selected {
+	case "process_exec":
+		result.Kind = correlate.ProcessExec
+	case "process_exit":
+		result.Kind = correlate.ProcessExit
+	case "process_kprobe":
+		switch e.Function {
+		case "security_file_permission":
+			var file struct {
+				Path string `json:"path"`
+			}
+			var mask int64
+			if len(e.Args) != 2 || !probeArg(e.Args[0], "file_arg", &file) || !probeArg(e.Args[1], "int_arg", &mask) || mask < 0 || mask > 1<<32-1 {
+				return zero, ErrRecord
+			}
+			if mask&2 == 0 {
+				return result, nil
+			}
+			result.Kind = correlate.FileWriteIntent
+			result.FilePath = file.Path
+			result.WriteMask = uint32(mask)
+		case "tcp_connect":
+			var sock struct {
+				Address  string `json:"daddr"`
+				Port     uint16 `json:"dport"`
+				Protocol string `json:"protocol"`
+			}
+			if len(e.Args) != 1 || !probeArg(e.Args[0], "sock_arg", &sock) || sock.Protocol != "IPPROTO_TCP" {
+				return zero, ErrRecord
+			}
+			addr, err := netip.ParseAddr(sock.Address)
+			if err != nil || sock.Port == 0 {
+				return zero, ErrRecord
+			}
+			result.Kind = correlate.TCPConnect
+			result.DestinationAddress = addr.String()
+			result.DestinationPort = sock.Port
+		}
+	}
+	return result, nil
+}
