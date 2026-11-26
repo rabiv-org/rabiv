@@ -80,3 +80,52 @@ func TestUnsafeProfilesAndNoImplicitPrivilege(t *testing.T) {
 		t.Fatal("ordinary host process accepted as isolated worker")
 	}
 }
+
+func TestProfileBoundaryAndPathSeparation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*Config)
+		valid  bool
+	}{
+		{"minimum memory", func(c *Config) { c.MemoryBytes = 128 << 20 }, true},
+		{"insufficient memory", func(c *Config) { c.MemoryBytes = (128 << 20) - 1 }, false},
+		{"maximum cpu", func(c *Config) { c.CPUPercent = 400 }, true},
+		{"excess cpu", func(c *Config) { c.CPUPercent = 401 }, false},
+		{"minimum tasks", func(c *Config) { c.Tasks = 8 }, true},
+		{"insufficient tasks", func(c *Config) { c.Tasks = 7 }, false},
+		{"maximum timeout", func(c *Config) { c.TimeoutSeconds = 3600 }, true},
+		{"excess timeout", func(c *Config) { c.TimeoutSeconds = 3601 }, false},
+		{"distinct primary gid", func(c *Config) { c.GID = 41077 }, true},
+		{"credential ancestor", func(c *Config) { c.CredentialPaths = []string{"/var/lib/example"} }, false},
+		{"workspace ancestor", func(c *Config) { c.Workspace = "/var/lib/example" }, false},
+		{"result under workspace", func(c *Config) { c.ResultRoot = c.Workspace + "/result" }, false},
+		{"fetch under result", func(c *Config) { c.FetchRoot = c.ResultRoot + "/fetch" }, false},
+		{"read only overlap", func(c *Config) { c.SyftBinary = c.Executable }, true},
+		{"runtime credentials masked", func(c *Config) {
+			c.CredentialPaths = []string{"/run/example/credential", "/var/run/example/credential"}
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := profile()
+			tc.change(&c)
+			if err := c.Validate(); (err == nil) != tc.valid {
+				t.Fatalf("valid=%v err=%v", tc.valid, err)
+			}
+		})
+	}
+}
+
+func TestWorkerEnvironmentRetainsRoleSpecificPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		entry string
+		valid bool
+	}{
+		{"LANG=token-in-value", true}, {"PATH=/usr/bin:/bin", true}, {"HOME=/nonexistent", true},
+		// Worker has no Docker socket; do not silently broaden its environment deny policy.
+		{"DOCKER_HOST=x", true}, {"git_config=x", false}, {"SSH_AUTH_SOCK=x", false}, {"custom_token=x", false}, {"password_file=x", false},
+	} {
+		if got := validWorkerEnvironment([]string{tc.entry}); got != tc.valid {
+			t.Fatalf("worker environment policy changed for %q", tc.entry)
+		}
+	}
+}
