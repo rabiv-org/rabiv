@@ -196,7 +196,7 @@ type Stream struct {
 
 func (c *Client) Events(ctx context.Context) (collect.LifecycleStream, error) {
 	filter := url.QueryEscape(`{"type":["container"]}`)
-	r, err := c.get(ctx, "/v"+c.version+"/events?filters="+filter)
+	r, err := c.get(ctx, "/v"+c.version+"/events?filters="+filter) //nolint:bodyclose // Ownership transfers to Stream.Close; Capture closes the stream before joining readers.
 	if err != nil {
 		return nil, err
 	}

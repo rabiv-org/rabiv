@@ -58,11 +58,14 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) (err error) 
 	return json.NewEncoder(out).Encode(ref)
 }
 
-func main() {
+func main() { os.Exit(mainExitCode()) }
+
+func mainExitCode() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx, os.Args[1:], os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, "rabiv-verifier:", err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }

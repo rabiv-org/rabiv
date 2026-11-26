@@ -68,7 +68,9 @@ func loadLab(t *testing.T) (string, labConfig) {
 	if !slices.Contains(strings.Split(string(osRelease), "\n"), "ID=ubuntu") {
 		t.Fatal("PRECONDITION: Ubuntu VM required; no host mutations allowed")
 	}
-	virt, err := exec.Command("/usr/bin/systemd-detect-virt").Output()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	virt, err := exec.CommandContext(ctx, "/usr/bin/systemd-detect-virt").Output()
 	if err != nil || strings.TrimSpace(string(virt)) != "kvm" {
 		t.Fatal("PRECONDITION: dedicated KVM guest required")
 	}
@@ -107,8 +109,10 @@ func loadLab(t *testing.T) (string, labConfig) {
 	err = dec.Decode(&cfg)
 	if err == nil {
 		var extra any
-		if e := dec.Decode(&extra); e != io.EOF {
-			err = fmt.Errorf("invalid trailing lab configuration: %v", e)
+		if e := dec.Decode(&extra); e == nil {
+			err = errors.New("unexpected trailing lab configuration")
+		} else if e != io.EOF {
+			err = fmt.Errorf("invalid trailing lab configuration: %w", e)
 		}
 	}
 	closeErr := f.Close()

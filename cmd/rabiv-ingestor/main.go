@@ -16,13 +16,16 @@ type list []string
 func (l *list) String() string     { return "repeatable" }
 func (l *list) Set(s string) error { *l = append(*l, s); return nil }
 
-func main() {
+func main() { os.Exit(mainExitCode()) }
+
+func mainExitCode() int {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	if err := run(ctx, os.Args[1:], os.Stdout); err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 func run(ctx context.Context, args []string, out io.Writer) error {

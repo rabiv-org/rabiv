@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"strings"
@@ -124,7 +125,7 @@ func BenchmarkZIPDirectoryRejection(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		if _, err := reader.Read(b.Context(), transport.Bytes(), []string{"item-00000"}); err != ErrArchive {
+		if _, err := reader.Read(b.Context(), transport.Bytes(), []string{"item-00000"}); !errors.Is(err, ErrArchive) {
 			b.Fatalf("rejected directory: %v", err)
 		}
 	}

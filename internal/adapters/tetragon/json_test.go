@@ -103,7 +103,7 @@ func TestLossReportsAndTruncatedStream(t *testing.T) {
 	if _, err = s.Next(); err == nil {
 		t.Fatal("truncated JSON accepted")
 	}
-	if _, err = s.Next(); err != io.EOF {
+	if _, err = s.Next(); err != io.EOF { //nolint:errorlint // Clean exhaustion must return the unwrapped io.EOF sentinel.
 		t.Fatal("stream EOF lost")
 	}
 }

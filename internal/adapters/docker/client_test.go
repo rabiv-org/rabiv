@@ -2,10 +2,46 @@ package docker
 
 import (
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 )
+
+type responseTransport struct{ response *http.Response }
+
+func (r responseTransport) RoundTrip(*http.Request) (*http.Response, error) { return r.response, nil }
+
+type ownedBody struct {
+	io.Reader
+	closed int
+}
+
+func (b *ownedBody) Close() error { b.closed++; return nil }
+
+func TestEventResponseOwnership(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusForbidden} {
+		body := &ownedBody{Reader: strings.NewReader(`{"Type":"container","Action":"start","time":1,"Actor":{"ID":"` + strings.Repeat("a", 64) + `"}}` + "\n")}
+		c := &Client{cfg: Config{MaxRecord: 4096}, http: &http.Client{Transport: responseTransport{&http.Response{StatusCode: status, Body: body}}}, version: "1.99"}
+		stream, err := c.Events(t.Context())
+		if status != http.StatusOK {
+			if err == nil || body.closed != 1 {
+				t.Fatalf("error response ownership: %v closes=%d", err, body.closed)
+			}
+			continue
+		}
+		if err != nil || body.closed != 0 {
+			t.Fatalf("premature close: %v closes=%d", err, body.closed)
+		}
+		if _, err := stream.Next(); err != nil {
+			t.Fatal(err)
+		}
+		if err := stream.Close(); err != nil || body.closed != 1 {
+			t.Fatalf("stream did not close body: %v closes=%d", err, body.closed)
+		}
+	}
+}
 
 func FuzzParseInspect(f *testing.F) {
 	id := strings.Repeat("c", 64)

@@ -95,7 +95,7 @@ func TestReferencesAndTransport(t *testing.T) {
 	if err := r.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if !r.Equal(r) {
+	if !r.Equal(r) { //nolint:gocritic // This assertion deliberately checks reference equality is reflexive.
 		t.Fatal("reference not reflexive")
 	}
 	x := r
