@@ -5,3 +5,54 @@ run:
 
 linters:
   default: standard
+
+  enable:
+    - bodyclose
+    - dupl
+    - errorlint
+    - funlen
+    - gocognit
+    - gocritic
+    - gocyclo
+    - noctx
+    - nolintlint
+    - revive
+
+  settings:
+    dupl:
+      threshold: 150
+
+    funlen:
+      lines: -1
+      statements: 50
+
+    gocognit:
+      min-complexity: 20
+
+    gocyclo:
+      min-complexity: 16
+
+    nolintlint:
+      allow-unused: false
+      require-explanation: true
+      require-specific: true
+
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+        - name: package-comments
+          disabled: true
+
+  exclusions:
+    rules:
+      - path: '_test\.go$'
+        linters:
+          - dupl
+          - funlen
+          - gocognit
+          - gocyclo
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
