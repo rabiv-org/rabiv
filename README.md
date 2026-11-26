@@ -31,9 +31,19 @@ go vet ./...
 make lint
 ```
 
+`make check` includes both lint profiles and shell syntax checks. For native Go
+coverage, `make test-cover` runs the default suite once with race detection and
+prints per-function coverage from `coverage.out`. Coverage is informational,
+with no percentage gate or external reporting service. Go coverage does not
+measure Python code, runtime telemetry coverage, or OS security enforcement.
+
 Default tests use local fixtures and do not start CI jobs or privileged VM tests.
 Unprivileged VM harness/receiver regressions also require `/usr/bin/python3`
 (standard library only); they mock account and systemd operations.
+`make test-python` runs those regressions independently for diagnosis. CI already
+runs them through the default Go suite and does not execute a duplicate Python
+step. `make shell-check` parses both VM scripts with `bash -n` without running
+their commands. These checks grant no authorization for privileged VM execution.
 Compile and statically check all opt-in tests without running their binaries:
 
 ```bash
