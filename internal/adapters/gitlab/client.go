@@ -70,14 +70,9 @@ func New(c Config, token []byte, transport http.RoundTripper) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	allowed := map[string]bool{o: true}
-	for _, raw := range c.ArtifactOrigins {
-		u, e := url.Parse(raw)
-		v, f := origin(raw)
-		if e != nil || f != nil || u.Path != "" || u.RawQuery != "" || u.ForceQuery {
-			return nil, ErrRedirect
-		}
-		allowed[v] = true
+	allowed, err := artifactOrigins(o, c.ArtifactOrigins)
+	if err != nil {
+		return nil, err
 	}
 	if transport == nil {
 		t := http.DefaultTransport.(*http.Transport).Clone()
@@ -86,6 +81,20 @@ func New(c Config, token []byte, transport http.RoundTripper) (*Client, error) {
 		transport = t
 	}
 	return &Client{cfg: c, http: &http.Client{Transport: transport, Timeout: c.Timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, token: bytes.Clone(token), allowed: allowed}, nil
+}
+
+func artifactOrigins(o string, origins []string) (map[string]bool, error) {
+	allowed := map[string]bool{o: true}
+	for _, raw := range origins {
+		u, e := url.Parse(raw)
+		v, f := origin(raw)
+		if e != nil || f != nil || u.Path != "" || u.RawQuery != "" || u.ForceQuery {
+			return nil, ErrRedirect
+		}
+		allowed[v] = true
+	}
+
+	return allowed, nil
 }
 
 // Close discards this client's credential and idle connections.
@@ -211,37 +220,48 @@ func (c *Client) Artifacts(ctx context.Context, id build.Identity) ([]byte, erro
 		case 301, 302, 303, 307, 308:
 			location := r.Header.Get("Location")
 			_ = r.Body.Close()
-			if location == "" || hop == 3 {
-				return nil, ErrRedirect
-			}
-			next, err := url.Parse(location)
+			current, err = c.redirectURL(u, location, hop)
 			if err != nil {
-				return nil, ErrRedirect
+				return nil, err
 			}
-			next = u.ResolveReference(next)
-			decoded, decodeErr := url.QueryUnescape(next.String())
-			if decodeErr != nil {
-				return nil, ErrRedirect
-			}
-			if len(c.token) > 0 && (strings.Contains(next.String(), string(c.token)) || strings.Contains(decoded, string(c.token))) {
-				return nil, ErrRedirect
-			}
-			current = next.String()
 			continue
 		case http.StatusOK:
-			defer func() { _ = r.Body.Close() }()
-			if r.ContentLength > c.cfg.MaxArchive || r.Header.Get("Content-Encoding") != "" && r.Header.Get("Content-Encoding") != "identity" {
-				return nil, ErrInvalid
-			}
-			b, err := acquire.ReadLimit(r.Body, c.cfg.MaxArchive)
-			if err != nil || r.ContentLength >= 0 && r.ContentLength != int64(len(b)) {
-				return nil, ErrUnavailable
-			}
-			return b, nil
+			return c.readArchive(r)
 		default:
 			_ = r.Body.Close()
 			return nil, ErrUnavailable
 		}
 	}
 	return nil, ErrRedirect
+}
+
+func (c *Client) redirectURL(u *url.URL, location string, hop int) (string, error) {
+	if location == "" || hop == 3 {
+		return "", ErrRedirect
+	}
+	next, err := url.Parse(location)
+	if err != nil {
+		return "", ErrRedirect
+	}
+	next = u.ResolveReference(next)
+	decoded, decodeErr := url.QueryUnescape(next.String())
+	if decodeErr != nil {
+		return "", ErrRedirect
+	}
+	if len(c.token) > 0 && (strings.Contains(next.String(), string(c.token)) || strings.Contains(decoded, string(c.token))) {
+		return "", ErrRedirect
+	}
+	return next.String(), nil
+}
+
+func (c *Client) readArchive(r *http.Response) ([]byte, error) {
+	defer func() { _ = r.Body.Close() }()
+	if r.ContentLength > c.cfg.MaxArchive || r.Header.Get("Content-Encoding") != "" && r.Header.Get("Content-Encoding") != "identity" {
+		return nil, ErrInvalid
+	}
+	b, err := acquire.ReadLimit(r.Body, c.cfg.MaxArchive)
+	if err != nil || r.ContentLength >= 0 && r.ContentLength != int64(len(b)) {
+		return nil, ErrUnavailable
+	}
+	return b, nil
 }

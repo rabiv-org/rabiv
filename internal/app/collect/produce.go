@@ -8,6 +8,7 @@ import (
 	jsonv2 "encoding/json/v2"
 	"errors"
 	"io"
+	"slices"
 	"time"
 
 	v1 "github.com/rabiv-org/rabiv/contracts/v1"
@@ -23,7 +24,15 @@ import (
 // The output object retains unresolved events and original capture reference.
 func Produce(ctx context.Context, source acquire.Source, sink acquire.Sink, captureRef artifact.ObjectReference, targets []build.Context, job build.Identity, workflow, id string, at time.Time, maxCapture int64) (artifact.ObjectReference, error) {
 	var zero artifact.ObjectReference
-	if job.Validate() != nil || artifact.ValidateID(id) != nil || artifact.ValidateID(workflow) != nil || artifact.ValidateID(id+".evidence") != nil || build.ValidateTime(at) != nil || maxCapture <= 0 || maxCapture > correlate.MaxCaptureBytes {
+	if job.Validate() != nil {
+		return zero, errors.New("invalid evidence production request")
+	}
+	for _, value := range []string{id, workflow, id + ".evidence"} {
+		if artifact.ValidateID(value) != nil {
+			return zero, errors.New("invalid evidence production request")
+		}
+	}
+	if build.ValidateTime(at) != nil || maxCapture <= 0 || maxCapture > correlate.MaxCaptureBytes {
 		return zero, errors.New("invalid evidence production request")
 	}
 	var selected *build.Context
@@ -35,22 +44,9 @@ func Produce(ctx context.Context, source acquire.Source, sink acquire.Sink, capt
 	if selected == nil {
 		return zero, errors.New("target job is not supplied")
 	}
+	header := v1.ManifestHeader{SchemaVersion: v1.SchemaVersion, Kind: v1.KindEvidenceManifest, ManifestID: id, WorkflowID: workflow, Build: *selected, RecordedAt: at, State: v1.Finalized}
 	if selected.ValidateComplete() != nil {
-		var budget correlate.TargetBudget
-		for _, target := range targets {
-			if err := budget.Add(target); err != nil {
-				return zero, err
-			}
-		}
-		m := v1.EvidenceManifest{ManifestHeader: v1.ManifestHeader{SchemaVersion: v1.SchemaVersion, Kind: v1.KindEvidenceManifest, ManifestID: id, WorkflowID: workflow, Build: *selected, RecordedAt: at, State: v1.Failed, Failure: &v1.Failure{Code: v1.InputUnavailable}}}
-		if e := m.Validate(); e != nil {
-			return zero, e
-		}
-		b, e := json.Marshal(m)
-		if e != nil {
-			return zero, e
-		}
-		return sink.Put(ctx, id, bytes.NewReader(b), correlate.MaxManifestBytes)
+		return writeMissingMetadata(ctx, sink, header, targets)
 	}
 	b, err := source.Get(ctx, captureRef, maxCapture)
 	if err != nil {
@@ -64,56 +60,13 @@ func Produce(ctx context.Context, source acquire.Source, sink acquire.Sink, capt
 	if err != nil {
 		return zero, err
 	}
-	p := &evidence.Bundle{Reference: ref, Scopes: []build.ExecutionScope{}, Observations: []evidence.ScopeObservation{}, ObservationWindow: &c.Window, Coverage: evidence.ObservationCoverage{Status: evidence.CoverageUnknown}, EventLoss: evidence.EventLoss{Status: evidence.LossUnknown}, Gaps: append([]evidence.Gap{}, r.Gaps...)}
-	if c.Dropped > 0 {
-		p.EventLoss = evidence.EventLoss{Status: evidence.LossReported, Count: &c.Dropped, Source: "LOCAL_CAPTURE_LIMIT"}
-	}
-	for _, e := range c.Events {
-		if e.Kind == correlate.SourceLoss && e.LossCount != nil && *e.LossCount > 0 {
-			p.EventLoss = evidence.EventLoss{Status: evidence.LossReported, Source: "CAPTURE_REPORTS"}
-		}
-	}
-	counts := map[string]uint64{}
-	for _, e := range r.Events {
-		if e.Resolution == "MATCHED" {
-			counts[e.ScopeID]++
-		}
-	}
-	for _, s := range r.Scopes {
-		if s.Build == job {
-			p.Scopes = append(p.Scopes, s.Execution)
-			if n := counts[s.Execution.ScopeID]; n > 0 {
-				p.Observations = append(p.Observations, evidence.ScopeObservation{ScopeID: s.Execution.ScopeID, EventSource: "TETRAGON", EventCount: &n})
-			}
-		}
-	}
-	if len(p.Scopes) == 0 || len(p.Observations) == 0 {
-		found := false
-		for _, g := range p.Gaps {
-			if g.Code == evidence.UnresolvedScope {
-				found = true
-			}
-		}
-		if !found {
-			p.Gaps = append(p.Gaps, evidence.Gap{Code: evidence.UnresolvedScope})
-		}
-	}
-	m := v1.EvidenceManifest{ManifestHeader: v1.ManifestHeader{SchemaVersion: v1.SchemaVersion, Kind: v1.KindEvidenceManifest, ManifestID: id, WorkflowID: workflow, Build: *selected, RecordedAt: at, State: v1.Finalized}, Payload: p}
+	p := evidenceBundle(c, r, job, ref)
+	m := v1.EvidenceManifest{ManifestHeader: header, Payload: p}
 	if c.Interrupted {
 		m.State = v1.Failed
 		m.Failure = &v1.Failure{Code: v1.InputUnavailable}
 	}
-	if err = m.Validate(); err != nil {
-		return zero, err
-	}
-	encoded, err := json.Marshal(m)
-	if err != nil {
-		return zero, err
-	}
-	if _, err = v1.DecodeEvidenceManifest(encoded); err != nil {
-		return zero, err
-	}
-	return sink.Put(ctx, id, bytes.NewReader(encoded), correlate.MaxManifestBytes)
+	return writeEvidenceManifest(ctx, sink, m)
 }
 
 // Correlation adds per-record fields and may repeat build/scope metadata, so
@@ -186,4 +139,70 @@ func encodeRows[T any](ctx context.Context, w io.Writer, prefix string, rows []T
 
 func writeJSON(w io.Writer, value any) error {
 	return jsonv2.MarshalWrite(w, value, json.DefaultOptionsV1())
+}
+
+func evidenceBundle(c correlate.Capture, r correlate.Result, job build.Identity, ref artifact.ObjectReference) *evidence.Bundle {
+	p := &evidence.Bundle{Reference: ref, Scopes: []build.ExecutionScope{}, Observations: []evidence.ScopeObservation{}, ObservationWindow: &c.Window, Coverage: evidence.ObservationCoverage{Status: evidence.CoverageUnknown}, EventLoss: evidence.EventLoss{Status: evidence.LossUnknown}, Gaps: append([]evidence.Gap{}, r.Gaps...)}
+	p.EventLoss = captureLoss(c)
+	counts := map[string]uint64{}
+	for _, e := range r.Events {
+		if e.Resolution == "MATCHED" {
+			counts[e.ScopeID]++
+		}
+	}
+	for _, s := range r.Scopes {
+		if s.Build == job {
+			p.Scopes = append(p.Scopes, s.Execution)
+			if n := counts[s.Execution.ScopeID]; n > 0 {
+				p.Observations = append(p.Observations, evidence.ScopeObservation{ScopeID: s.Execution.ScopeID, EventSource: "TETRAGON", EventCount: &n})
+			}
+		}
+	}
+	if (len(p.Scopes) == 0 || len(p.Observations) == 0) && !slices.Contains(p.Gaps, evidence.Gap{Code: evidence.UnresolvedScope}) {
+		p.Gaps = append(p.Gaps, evidence.Gap{Code: evidence.UnresolvedScope})
+	}
+
+	return p
+}
+
+func captureLoss(c correlate.Capture) evidence.EventLoss {
+	loss := evidence.EventLoss{Status: evidence.LossUnknown}
+	if c.Dropped > 0 {
+		loss = evidence.EventLoss{Status: evidence.LossReported, Count: &c.Dropped, Source: "LOCAL_CAPTURE_LIMIT"}
+	}
+	for _, e := range c.Events {
+		if e.Kind == correlate.SourceLoss && e.LossCount != nil && *e.LossCount > 0 {
+			loss = evidence.EventLoss{Status: evidence.LossReported, Source: "CAPTURE_REPORTS"}
+		}
+	}
+
+	return loss
+}
+
+func writeEvidenceManifest(ctx context.Context, sink acquire.Sink, m v1.EvidenceManifest) (artifact.ObjectReference, error) {
+	var zero artifact.ObjectReference
+	if err := m.Validate(); err != nil {
+		return zero, err
+	}
+	encoded, err := json.Marshal(m)
+	if err != nil {
+		return zero, err
+	}
+	if _, err = v1.DecodeEvidenceManifest(encoded); err != nil {
+		return zero, err
+	}
+	return sink.Put(ctx, m.ManifestID, bytes.NewReader(encoded), correlate.MaxManifestBytes)
+}
+
+func writeMissingMetadata(ctx context.Context, sink acquire.Sink, header v1.ManifestHeader, targets []build.Context) (artifact.ObjectReference, error) {
+	var budget correlate.TargetBudget
+	for _, target := range targets {
+		if err := budget.Add(target); err != nil {
+			return artifact.ObjectReference{}, err
+		}
+	}
+
+	header.State = v1.Failed
+	header.Failure = &v1.Failure{Code: v1.InputUnavailable}
+	return writeEvidenceManifest(ctx, sink, v1.EvidenceManifest{ManifestHeader: header})
 }

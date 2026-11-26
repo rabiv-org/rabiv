@@ -90,7 +90,14 @@ func subjectSelection(names []string, digest artifact.Digest) (map[string]bool, 
 	return seen, nil
 }
 
-func validByteLimit(limit int64) bool { return limit > 0 && limit <= acquire.MaxObjectBytes }
+func validByteLimits(limits ...int64) bool {
+	for _, limit := range limits {
+		if limit <= 0 || limit > acquire.MaxObjectBytes {
+			return false
+		}
+	}
+	return len(limits) > 0
+}
 
 func (r WorkerResult) Validate() error {
 	if r.Version != workerResultVersion || r.Build.ValidateComplete() != nil || r.JobRef.Validate() != nil || r.Archive.Validate() != nil || r.Subjects == nil || r.SBOMs == nil || r.Issues == nil {
@@ -100,6 +107,26 @@ func (r WorkerResult) Validate() error {
 	if err != nil {
 		return err
 	}
+	if err := r.validateMetadata(); err != nil {
+		return err
+	}
+	subjects, err := r.validateSubjects(requested)
+	if err != nil {
+		return err
+	}
+	if r.Failure == nil && (len(subjects) != len(requested) || len(r.SBOMs) != len(subjects)) {
+		return errors.New("missing subjects or SBOMs")
+	}
+	if err := r.validateSBOMs(subjects); err != nil {
+		return err
+	}
+	if r.Failure != nil {
+		return r.Failure.Validate()
+	}
+	return nil
+}
+
+func (r WorkerResult) validateMetadata() error {
 	for _, ref := range []*artifact.ObjectReference{r.ProvenanceRaw, r.ExistingSBOM} {
 		if ref != nil && ref.Validate() != nil {
 			return errors.New("invalid raw metadata reference")
@@ -115,17 +142,24 @@ func (r WorkerResult) Validate() error {
 			return errors.New("invalid acquisition issue code")
 		}
 	}
+
+	return nil
+}
+
+func (r WorkerResult) validateSubjects(requested map[string]bool) (map[string]artifact.Digest, error) {
 	subjects := make(map[string]artifact.Digest, len(r.Subjects))
 	for _, s := range r.Subjects {
 		_, duplicate := subjects[s.Subject.Name]
 		if s.Reference.Validate() != nil || s.Reference.Digest != s.Subject.Digest || !requested[s.Subject.Name] || duplicate {
-			return errors.New("subject reference mismatch")
+			return nil, errors.New("subject reference mismatch")
 		}
 		subjects[s.Subject.Name] = s.Subject.Digest
 	}
-	if r.Failure == nil && (len(subjects) != len(requested) || len(r.SBOMs) != len(subjects)) {
-		return errors.New("missing subjects or SBOMs")
-	}
+
+	return subjects, nil
+}
+
+func (r WorkerResult) validateSBOMs(subjects map[string]artifact.Digest) error {
 	seen := map[string]bool{}
 	for _, s := range r.SBOMs {
 		if s.Reference.Validate() != nil || s.Subject.Validate() != nil || seen[s.Subject.Name] || subjects[s.Subject.Name] != s.Subject.Digest {
@@ -133,9 +167,7 @@ func (r WorkerResult) Validate() error {
 		}
 		seen[s.Subject.Name] = true
 	}
-	if r.Failure != nil {
-		return r.Failure.Validate()
-	}
+
 	return nil
 }
 
@@ -152,7 +184,7 @@ func DecodeWorker(data []byte) (WorkerResult, error) {
 // Raw malformed provenance is stored before parsing and never silently repaired.
 func Process(ctx context.Context, fetch acquire.Source, out acquire.Sink, archive ArchiveReader, scanner Scanner, parser ProvenanceParser, jobRef artifact.ObjectReference, id string, names []string, maxArchive, maxEntry, maxSBOM int64) (artifact.ObjectReference, error) {
 	var zero artifact.ObjectReference
-	if artifact.ValidateID(id) != nil || jobRef.Validate() != nil || !validByteLimit(maxArchive) || !validByteLimit(maxEntry) || !validByteLimit(maxSBOM) {
+	if artifact.ValidateID(id) != nil || jobRef.Validate() != nil || !validByteLimits(maxArchive, maxEntry, maxSBOM) {
 		return zero, errors.New("invalid worker request")
 	}
 	// Reuse domain validation for exact logical names and duplicate selection.
@@ -173,16 +205,7 @@ func Process(ctx context.Context, fetch acquire.Source, out acquire.Sink, archiv
 		return zero, errors.New("fetched archive unavailable")
 	}
 	r := WorkerResult{Version: workerResultVersion, Build: job.Build, JobRef: jobRef, Archive: *job.Archive, RequestedSubjects: slices.Clone(names), Subjects: []SubjectObject{}, SBOMs: []SBOMObject{}, Issues: []string{}}
-	finish := func() (artifact.ObjectReference, error) {
-		if e := r.Validate(); e != nil {
-			return zero, e
-		}
-		data, e := json.Marshal(r)
-		if e != nil {
-			return zero, e
-		}
-		return out.Put(ctx, id, bytes.NewReader(data), 1<<20)
-	}
+
 	transport, err := fetch.Get(ctx, *job.Archive, maxArchive)
 	if err != nil {
 		// A referenced-object read can fail because of storage or integrity.
@@ -193,15 +216,27 @@ func Process(ctx context.Context, fetch acquire.Source, out acquire.Sink, archiv
 	contents, err := archive.Read(ctx, transport, names)
 	if err != nil {
 		r.Failure = acquire.Failure(err)
-		return finish()
+		return writeWorkerResult(ctx, out, id, r)
 	}
-	put := func(data []byte, limit int64) (artifact.ObjectReference, error) {
-		return out.Put(ctx, "sha256-"+acquire.Hash(data).Value, bytes.NewReader(data), limit)
+	if err := r.storeMetadata(ctx, out, parser, contents, maxSBOM); err != nil {
+		return zero, err
 	}
+	if err := r.scanSubjects(ctx, out, scanner, contents.Subjects, maxEntry, maxSBOM); err != nil {
+		return zero, err
+	}
+	r.noteProvenanceMismatch()
+	return writeWorkerResult(ctx, out, id, r)
+}
+
+func storeContent(ctx context.Context, out acquire.Sink, data []byte, limit int64) (artifact.ObjectReference, error) {
+	return out.Put(ctx, "sha256-"+acquire.Hash(data).Value, bytes.NewReader(data), limit)
+}
+
+func (r *WorkerResult) storeMetadata(ctx context.Context, out acquire.Sink, parser ProvenanceParser, contents Contents, maxSBOM int64) error {
 	if contents.ProvenancePresent {
-		ref, e := put(contents.Provenance, 1<<20)
+		ref, e := storeContent(ctx, out, contents.Provenance, 1<<20)
 		if e != nil {
-			return zero, e
+			return e
 		}
 		r.ProvenanceRaw = &ref
 		r.Provenance, r.Issues = parser.Parse(contents.Provenance, ref)
@@ -209,32 +244,54 @@ func Process(ctx context.Context, fetch acquire.Source, out acquire.Sink, archiv
 		r.Issues = append(r.Issues, "PROVENANCE_MISSING")
 	}
 	if contents.SBOMPresent {
-		ref, e := put(contents.ExistingSBOM, maxSBOM)
+		ref, e := storeContent(ctx, out, contents.ExistingSBOM, maxSBOM)
 		if e != nil {
-			return zero, e
+			return e
 		}
 		r.ExistingSBOM = &ref
 		r.Issues = append(r.Issues, "EXISTING_SBOM_UNVERIFIED")
 	}
-	for _, s := range contents.Subjects {
-		ref, e := put(s.Bytes, maxEntry)
+
+	return nil
+}
+
+func (r *WorkerResult) scanSubjects(ctx context.Context, out acquire.Sink, scanner Scanner, subjects []SubjectBytes, maxEntry, maxSBOM int64) error {
+	for _, s := range subjects {
+		ref, e := storeContent(ctx, out, s.Bytes, maxEntry)
 		if e != nil {
-			return zero, e
+			return e
 		}
 		subject := artifact.Subject{Name: s.Name, Digest: ref.Digest}
 		r.Subjects = append(r.Subjects, SubjectObject{Subject: subject, Reference: ref})
 		sbom, e := scanner.Scan(ctx, s.Bytes, ref.Digest)
 		if e != nil {
 			r.Failure = acquire.Failure(e)
-			return finish()
+			// Scanner failure is a producer outcome; channel failures return errors.
+			return nil
 		}
-		ref, e = put(sbom, maxSBOM)
+		ref, e = storeContent(ctx, out, sbom, maxSBOM)
 		if e != nil {
-			return zero, e
+			return e
 		}
 		r.SBOMs = append(r.SBOMs, SBOMObject{Subject: subject, Reference: ref})
 	}
-	if r.Provenance != nil {
+
+	return nil
+}
+
+func writeWorkerResult(ctx context.Context, out acquire.Sink, id string, r WorkerResult) (artifact.ObjectReference, error) {
+	if e := r.Validate(); e != nil {
+		return artifact.ObjectReference{}, e
+	}
+	data, e := json.Marshal(r)
+	if e != nil {
+		return artifact.ObjectReference{}, e
+	}
+	return out.Put(ctx, id, bytes.NewReader(data), 1<<20)
+}
+
+func (r *WorkerResult) noteProvenanceMismatch() {
+	if r.Failure == nil && r.Provenance != nil {
 		var subjects []artifact.Subject
 		for _, s := range r.Subjects {
 			subjects = append(subjects, s.Subject)
@@ -243,5 +300,4 @@ func Process(ctx context.Context, fetch acquire.Source, out acquire.Sink, archiv
 			r.Issues = append(r.Issues, "PROVENANCE_SUBJECT_MISMATCH")
 		}
 	}
-	return finish()
 }

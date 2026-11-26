@@ -110,18 +110,32 @@ func (c Checker) Check(ctx context.Context, ref artifact.ObjectReference, expect
 	if d.Verdict != decision.Allow {
 		return zero, ErrNonAllow
 	}
-	now := c.Now()
-	if build.ValidateTime(now) != nil || now.Before(d.IssuedAt) || !now.Before(*d.ExpiresAt) || d.ExpiresAt.Sub(d.IssuedAt) > c.MaxValidity {
-		return zero, ErrFreshness
+	if err := c.checkFreshness(d); err != nil {
+		return zero, err
 	}
-	if expected == nil {
-		return zero, ErrContextUnavailable
-	}
-	if err := expected.validate(); err != nil {
-		return zero, fmt.Errorf("expected context: %w", err)
-	}
-	if d.WorkflowID != expected.WorkflowID || d.Build.Identity != expected.Build || !d.SubjectGroup.Equal(expected.SubjectGroup) {
-		return zero, ErrBindingMismatch
+	if err := checkExpectedContext(d, expected); err != nil {
+		return zero, err
 	}
 	return CheckedHandoff{Reference: ref, Record: record}, nil
+}
+
+func (c Checker) checkFreshness(d decision.Decision) error {
+	now := c.Now()
+	if build.ValidateTime(now) != nil || now.Before(d.IssuedAt) || !now.Before(*d.ExpiresAt) || d.ExpiresAt.Sub(d.IssuedAt) > c.MaxValidity {
+		return ErrFreshness
+	}
+	return nil
+}
+
+func checkExpectedContext(d decision.Decision, expected *ExpectedContext) error {
+	if expected == nil {
+		return ErrContextUnavailable
+	}
+	if err := expected.validate(); err != nil {
+		return fmt.Errorf("expected context: %w", err)
+	}
+	if d.WorkflowID != expected.WorkflowID || d.Build.Identity != expected.Build || !d.SubjectGroup.Equal(expected.SubjectGroup) {
+		return ErrBindingMismatch
+	}
+	return nil
 }

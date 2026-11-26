@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -87,51 +88,27 @@ func Normalize(data []byte, maxRecord int64) (correlate.Event, error) {
 		return zero, ErrRecord
 	}
 	result := correlate.Event{At: at, Source: "TETRAGON", Kind: correlate.Unsupported}
-	selected := ""
-	for k, v := range raw {
-		if (strings.HasPrefix(k, "process_") || k == "rate_limit_info") && string(v) != "null" {
-			if selected != "" {
-				return zero, ErrRecord
-			}
-			selected = k
-		}
+	selected, err := nativeEventKind(raw)
+	if err != nil {
+		return zero, err
 	}
 	if selected == "" {
 		return result, nil
 	}
 	result.NativeKind = selected
 	if selected == "rate_limit_info" {
-		var loss struct {
-			Count json.Number `json:"number_of_dropped_process_events"`
-		}
-		if jsoninput.Decode(raw[selected], &loss, false) != nil {
-			return zero, ErrRecord
-		}
-		count, e := strconv.ParseUint(string(loss.Count), 10, 64)
-		if e != nil {
-			return zero, ErrRecord
-		}
-		result.Kind = correlate.SourceLoss
-		result.LossCount = &count
-		return result, nil
+		return normalizeLoss(raw[selected], result)
 	}
-	if selected != "process_exec" && selected != "process_exit" && selected != "process_kprobe" {
+	if !slices.Contains([]string{"process_exec", "process_exit", "process_kprobe"}, selected) {
 		return result, nil
 	}
 	var e event
 	if jsoninput.Decode(raw[selected], &e, false) != nil {
 		return zero, ErrRecord
 	}
-	result.ContainerID = e.Process.Docker
-	result.ExecID = e.Process.ExecID
-	result.ParentExecID = e.Parent.ExecID
-	result.PID = e.Process.PID
-	result.Binary = e.Process.Binary
-	if result.ContainerID != "" && (build.ObservedContainerID{Runtime: "DOCKER", Value: result.ContainerID}).Validate() != nil {
-		return zero, ErrRecord
-	}
-	if result.ExecID == "" || len(result.ExecID) > correlate.MaxExecIDBytes || len(result.ParentExecID) > correlate.MaxExecIDBytes {
-		return zero, ErrRecord
+	result, err = withProcessMetadata(result, e)
+	if err != nil {
+		return zero, err
 	}
 	switch selected {
 	case "process_exec":
@@ -139,38 +116,89 @@ func Normalize(data []byte, maxRecord int64) (correlate.Event, error) {
 	case "process_exit":
 		result.Kind = correlate.ProcessExit
 	case "process_kprobe":
-		switch e.Function {
-		case "security_file_permission":
-			var file struct {
-				Path string `json:"path"`
+		return normalizeProbe(e, result)
+	}
+	return result, nil
+}
+
+func nativeEventKind(raw map[string]json.RawMessage) (string, error) {
+	selected := ""
+	for k, v := range raw {
+		if (strings.HasPrefix(k, "process_") || k == "rate_limit_info") && string(v) != "null" {
+			if selected != "" {
+				return "", ErrRecord
 			}
-			var mask int64
-			if len(e.Args) != 2 || !probeArg(e.Args[0], "file_arg", &file) || !probeArg(e.Args[1], "int_arg", &mask) || mask < 0 || mask > 1<<32-1 {
-				return zero, ErrRecord
-			}
-			if mask&2 == 0 {
-				return result, nil
-			}
-			result.Kind = correlate.FileWriteIntent
-			result.FilePath = file.Path
-			result.WriteMask = uint32(mask)
-		case "tcp_connect":
-			var sock struct {
-				Address  string `json:"daddr"`
-				Port     uint16 `json:"dport"`
-				Protocol string `json:"protocol"`
-			}
-			if len(e.Args) != 1 || !probeArg(e.Args[0], "sock_arg", &sock) || sock.Protocol != "IPPROTO_TCP" {
-				return zero, ErrRecord
-			}
-			addr, err := netip.ParseAddr(sock.Address)
-			if err != nil || sock.Port == 0 {
-				return zero, ErrRecord
-			}
-			result.Kind = correlate.TCPConnect
-			result.DestinationAddress = addr.String()
-			result.DestinationPort = sock.Port
+			selected = k
 		}
 	}
+
+	return selected, nil
+}
+
+func normalizeLoss(data []byte, result correlate.Event) (correlate.Event, error) {
+	var loss struct {
+		Count json.Number `json:"number_of_dropped_process_events"`
+	}
+	if jsoninput.Decode(data, &loss, false) != nil {
+		return correlate.Event{}, ErrRecord
+	}
+	count, e := strconv.ParseUint(string(loss.Count), 10, 64)
+	if e != nil {
+		return correlate.Event{}, ErrRecord
+	}
+	result.Kind = correlate.SourceLoss
+	result.LossCount = &count
+	return result, nil
+}
+
+func normalizeProbe(e event, result correlate.Event) (correlate.Event, error) {
+	switch e.Function {
+	case "security_file_permission":
+		var file struct {
+			Path string `json:"path"`
+		}
+		var mask int64
+		if len(e.Args) != 2 || !probeArg(e.Args[0], "file_arg", &file) || !probeArg(e.Args[1], "int_arg", &mask) || mask < 0 || mask > 1<<32-1 {
+			return correlate.Event{}, ErrRecord
+		}
+		if mask&2 == 0 {
+			return result, nil
+		}
+		result.Kind = correlate.FileWriteIntent
+		result.FilePath = file.Path
+		result.WriteMask = uint32(mask)
+	case "tcp_connect":
+		var sock struct {
+			Address  string `json:"daddr"`
+			Port     uint16 `json:"dport"`
+			Protocol string `json:"protocol"`
+		}
+		if len(e.Args) != 1 || !probeArg(e.Args[0], "sock_arg", &sock) || sock.Protocol != "IPPROTO_TCP" {
+			return correlate.Event{}, ErrRecord
+		}
+		addr, err := netip.ParseAddr(sock.Address)
+		if err != nil || sock.Port == 0 {
+			return correlate.Event{}, ErrRecord
+		}
+		result.Kind = correlate.TCPConnect
+		result.DestinationAddress = addr.String()
+		result.DestinationPort = sock.Port
+	}
+	return result, nil
+}
+
+func withProcessMetadata(result correlate.Event, e event) (correlate.Event, error) {
+	result.ContainerID = e.Process.Docker
+	result.ExecID = e.Process.ExecID
+	result.ParentExecID = e.Parent.ExecID
+	result.PID = e.Process.PID
+	result.Binary = e.Process.Binary
+	if result.ContainerID != "" && (build.ObservedContainerID{Runtime: "DOCKER", Value: result.ContainerID}).Validate() != nil {
+		return correlate.Event{}, ErrRecord
+	}
+	if result.ExecID == "" || len(result.ExecID) > correlate.MaxExecIDBytes || len(result.ParentExecID) > correlate.MaxExecIDBytes {
+		return correlate.Event{}, ErrRecord
+	}
+
 	return result, nil
 }
