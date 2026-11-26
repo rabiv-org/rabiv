@@ -174,26 +174,9 @@ func openAnchor(name string) (*os.Root, error) {
 		return nil, errors.Join(err, r.Close())
 	}
 	for _, part := range strings.Split(strings.TrimPrefix(name, "/"), "/") {
-		info, e := r.Lstat(part)
-		if e == nil {
-			e = checkAncestor(info)
-		}
+		next, e := openAncestor(r, part)
 		if e != nil {
 			return nil, errors.Join(e, r.Close())
-		}
-		next, e := r.OpenRoot(part)
-		if e != nil {
-			return nil, errors.Join(e, r.Close())
-		}
-		after, e := next.Stat(".")
-		if e == nil && !os.SameFile(info, after) {
-			e = ErrUnsafeStore
-		}
-		if e == nil {
-			e = checkAncestor(after)
-		}
-		if e != nil {
-			return nil, errors.Join(e, next.Close(), r.Close())
 		}
 		if e := r.Close(); e != nil {
 			return nil, errors.Join(e, next.Close())
@@ -208,6 +191,31 @@ func openAnchor(name string) (*os.Root, error) {
 		return nil, errors.Join(err, r.Close())
 	}
 	return r, nil
+}
+
+func openAncestor(parent *os.Root, name string) (*os.Root, error) {
+	info, err := parent.Lstat(name)
+	if err == nil {
+		err = checkAncestor(info)
+	}
+	if err != nil {
+		return nil, err
+	}
+	child, err := parent.OpenRoot(name)
+	if err != nil {
+		return nil, err
+	}
+	after, err := child.Stat(".")
+	if err == nil && !os.SameFile(info, after) {
+		err = ErrUnsafeStore
+	}
+	if err == nil {
+		err = checkAncestor(after)
+	}
+	if err != nil {
+		return nil, errors.Join(err, child.Close())
+	}
+	return child, nil
 }
 
 func checkAncestor(info os.FileInfo) error {
@@ -363,15 +371,66 @@ func (s *snapshotFS) putBytes(ctx context.Context, id string, data []byte) (err 
 			err = fmt.Errorf("%w: %w", ErrCommitUncertain, err)
 		}
 	}()
+	if err = s.writeStaged(f, data); err != nil {
+		return err
+	}
+	err = f.Close()
+	fileOpen = false
+	if err != nil {
+		return err
+	}
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+	if err = s.linkSnapshot(ctx, temp, name, id, data); err != nil {
+		return err
+	}
+	visible = true
+	// Finish durability after visibility even if cancellation arrives.
+	removed, err := s.syncPublished(temp)
+	tempLive = !removed
+	return err
+}
+
+// syncPublished reports removal separately so the owner retains correct cleanup
+// state even if the final directory synchronization fails.
+func (s *snapshotFS) syncPublished(temp string) (removed bool, err error) {
+	if err := s.syncDir(s.committed); err != nil {
+		return false, err
+	}
+	if err := s.staging.Remove(temp); err != nil {
+		return false, err
+	}
+	return true, s.syncDir(s.staging)
+}
+
+func (s *snapshotFS) linkSnapshot(ctx context.Context, temp, name, id string, data []byte) error {
+	err := s.root.Link("staging/"+temp, "committed/"+name)
+	if errors.Is(err, os.ErrExist) {
+		existing, e := s.read(ctx, id)
+		if e != nil {
+			return e
+		}
+		if !bytes.Equal(existing, data) {
+			return ErrConflict
+		}
+	} else if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *snapshotFS) writeStaged(f *os.File, data []byte) error {
 	if n, e := f.Write(data); e != nil {
 		return e
 	} else if n != len(data) {
 		return io.ErrShortWrite
 	}
-	if err = f.Chown(-1, s.cfg.ReaderGID); err != nil {
+	if err := f.Chown(-1, s.cfg.ReaderGID); err != nil {
 		return err
 	}
-	if err = f.Chmod(0440); err != nil {
+	if err := f.Chmod(0440); err != nil {
 		return err
 	}
 	info, e := f.Stat()
@@ -385,41 +444,10 @@ func (s *snapshotFS) putBytes(ctx context.Context, id string, data []byte) (err 
 	if !info.Mode().IsRegular() || info.Mode().Perm() != 0440 || int(st.Uid) != s.cfg.VerifierUID || int(st.Gid) != s.cfg.ReaderGID {
 		return ErrUnsafeStore
 	}
-	if err = s.syncFile(f); err != nil {
+	if err := s.syncFile(f); err != nil {
 		return err
 	}
-	err = f.Close()
-	fileOpen = false
-	if err != nil {
-		return err
-	}
-	if err = ctx.Err(); err != nil {
-		return err
-	}
-	err = s.root.Link("staging/"+temp, "committed/"+name)
-	if errors.Is(err, os.ErrExist) {
-		existing, e := s.read(ctx, id)
-		if e != nil {
-			return e
-		}
-		if !bytes.Equal(existing, data) {
-			return ErrConflict
-		}
-	} else if err != nil {
-		return err
-	}
-	visible = true
-	// After visibility, finish synchronization even if cancellation arrives.
-	if err = s.syncDir(s.committed); err != nil {
-		return err
-	}
-	if err = s.staging.Remove(temp); err != nil {
-		return err
-	}
-	tempLive = false
-	if err = s.syncDir(s.staging); err != nil {
-		return err
-	}
+
 	return nil
 }
 

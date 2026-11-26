@@ -97,6 +97,31 @@ func TestPrivateStagingAndDurableOrdering(t *testing.T) {
 	}
 }
 
+func TestDecisionCancellationAfterVisibilityFinishesDurability(t *testing.T) {
+	s := functionalStore(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	calls := 0
+	s.syncFile = func(f *os.File) error {
+		calls++
+		info, err := f.Stat()
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			cancel()
+		}
+		return f.Sync()
+	}
+	if err := s.putBytes(ctx, "cancel-after-link", []byte("complete")); err != nil || ctx.Err() == nil || calls != 3 {
+		t.Fatalf("durability interrupted: calls=%d err=%v", calls, err)
+	}
+	data, err := s.read(context.Background(), "cancel-after-link")
+	if err != nil || string(data) != "complete" {
+		t.Fatalf("committed decision lost: %v", err)
+	}
+}
+
 func TestSnapshotSyncFailures(t *testing.T) {
 	for _, stage := range []int{1, 2, 3} {
 		t.Run(fmt.Sprint(stage), func(t *testing.T) {
