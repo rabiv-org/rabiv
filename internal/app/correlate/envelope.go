@@ -95,16 +95,8 @@ func (b *CaptureBudget) Add(row any) error {
 	switch v := row.(type) {
 	case Container:
 		record = true
-		if v.StartedAt != nil {
-			key = budgetEpoch{v.ID, v.StartedAt.UTC()}
-			// 336 is the fixed execution JSON including the longest role,
-			// scope/full-container IDs, and two 30-character UTC timestamps.
-			weight = 336 + int64(len(b.host)+len(b.boot)) + 148
-			if v.RawRole != "" {
-				weight += 12 + quotedSize(v.RawRole)
-			}
-			growth = max(0, weight-b.epochs[key])
-		}
+		key, weight = b.scopeWeight(v)
+		growth = max(0, weight-b.epochs[key])
 	case Event:
 		record = true
 	case Diagnostic:
@@ -132,6 +124,22 @@ func (b *CaptureBudget) Add(row any) error {
 		b.epochs[key] = weight
 	}
 	return nil
+}
+
+func (b *CaptureBudget) scopeWeight(v Container) (budgetEpoch, int64) {
+	if v.StartedAt == nil {
+		return budgetEpoch{}, 0
+	}
+	var key budgetEpoch
+	var weight int64
+	key = budgetEpoch{v.ID, v.StartedAt.UTC()}
+	// 336 is the fixed execution JSON including the longest role,
+	// scope/full-container IDs, and two 30-character UTC timestamps.
+	weight = 336 + int64(len(b.host)+len(b.boot)) + 148
+	if v.RawRole != "" {
+		weight += 12 + quotedSize(v.RawRole)
+	}
+	return key, weight
 }
 
 // quotedSize matches Go's legacy JSON string encoding, including HTML/JS

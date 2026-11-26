@@ -59,33 +59,40 @@ func token(d *json.Decoder, data []byte) (json.Token, error) {
 	if _, ok := t.(string); ok {
 		raw := data[start:d.InputOffset()]
 		raw = raw[bytes.IndexByte(raw, '"'):]
-		for i := 1; i < len(raw)-1; i++ {
-			if raw[i] != '\\' {
-				continue
-			}
-			i++
-			if raw[i] != 'u' {
-				continue
-			}
-			code, e := strconv.ParseUint(string(raw[i+1:i+5]), 16, 16)
-			if e != nil {
-				return nil, ErrInvalid
-			}
-			i += 4
-			if !utf16.IsSurrogate(rune(code)) {
-				continue
-			}
-			if code >= 0xdc00 || i+7 >= len(raw) || raw[i+1] != '\\' || raw[i+2] != 'u' {
-				return nil, ErrInvalid
-			}
-			low, e := strconv.ParseUint(string(raw[i+3:i+7]), 16, 16)
-			if e != nil || utf16.DecodeRune(rune(code), rune(low)) == utf8.RuneError {
-				return nil, ErrInvalid
-			}
-			i += 6
+		if err := checkEscapedString(raw); err != nil {
+			return nil, err
 		}
 	}
 	return t, nil
+}
+
+func checkEscapedString(raw []byte) error {
+	for i := 1; i < len(raw)-1; i++ {
+		if raw[i] != '\\' {
+			continue
+		}
+		i++
+		if raw[i] != 'u' {
+			continue
+		}
+		code, e := strconv.ParseUint(string(raw[i+1:i+5]), 16, 16)
+		if e != nil {
+			return ErrInvalid
+		}
+		i += 4
+		if !utf16.IsSurrogate(rune(code)) {
+			continue
+		}
+		if code >= 0xdc00 || i+7 >= len(raw) || raw[i+1] != '\\' || raw[i+2] != 'u' {
+			return ErrInvalid
+		}
+		low, e := strconv.ParseUint(string(raw[i+3:i+7]), 16, 16)
+		if e != nil || utf16.DecodeRune(rune(code), rune(low)) == utf8.RuneError {
+			return ErrInvalid
+		}
+		i += 6
+	}
+	return nil
 }
 
 func scan(d *json.Decoder, data []byte, closed bool, depth int) error {
@@ -98,33 +105,43 @@ func scan(d *json.Decoder, data []byte, closed bool, depth int) error {
 	}
 	switch t {
 	case json.Delim('{'):
-		seen := map[string]bool{}
-		for d.More() {
-			k, err := token(d, data)
-			key, ok := k.(string)
-			if err != nil || !ok || seen[key] || closed && !canonical(key) {
-				return ErrInvalid
-			}
-			seen[key] = true
-			if scan(d, data, closed, depth+1) != nil {
-				return ErrInvalid
-			}
-		}
-		end, err := d.Token()
-		if err != nil || end != json.Delim('}') {
-			return ErrInvalid
-		}
+		return scanObject(d, data, closed, depth)
 	case json.Delim('['):
-		for d.More() {
-			if scan(d, data, closed, depth+1) != nil {
-				return ErrInvalid
-			}
-		}
-		end, err := d.Token()
-		if err != nil || end != json.Delim(']') {
+		return scanArray(d, data, closed, depth)
+	case json.Delim('}'), json.Delim(']'):
+		return ErrInvalid
+	}
+	return nil
+}
+
+func scanObject(d *json.Decoder, data []byte, closed bool, depth int) error {
+	seen := map[string]bool{}
+	for d.More() {
+		k, err := token(d, data)
+		key, ok := k.(string)
+		if err != nil || !ok || seen[key] || closed && !canonical(key) {
 			return ErrInvalid
 		}
-	case json.Delim('}'), json.Delim(']'):
+		seen[key] = true
+		if scan(d, data, closed, depth+1) != nil {
+			return ErrInvalid
+		}
+	}
+	end, err := d.Token()
+	if err != nil || end != json.Delim('}') {
+		return ErrInvalid
+	}
+	return nil
+}
+
+func scanArray(d *json.Decoder, data []byte, closed bool, depth int) error {
+	for d.More() {
+		if scan(d, data, closed, depth+1) != nil {
+			return ErrInvalid
+		}
+	}
+	end, err := d.Token()
+	if err != nil || end != json.Delim(']') {
 		return ErrInvalid
 	}
 	return nil
