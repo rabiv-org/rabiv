@@ -138,6 +138,25 @@ func (d Decision) Validate() error {
 			return fmt.Errorf("expiry must follow issue time")
 		}
 	}
+	missingEvidence, err := d.validateInputReferences()
+	if err != nil {
+		return err
+	}
+	if err := d.validatePolicyMetadata(); err != nil {
+		return err
+	}
+	missingMetadata := d.Build.ValidateComplete() != nil || d.SubjectGroup == nil || d.Baseline == nil || d.ProjectProfile == nil
+	facts, err := d.validateReasons()
+	if err != nil {
+		return err
+	}
+	if err := d.validateRequiredInputs(missingEvidence, missingMetadata, facts); err != nil {
+		return err
+	}
+	return d.validateVerdict(missingEvidence, missingMetadata, facts)
+}
+
+func (d Decision) validateInputReferences() (bool, error) {
 	missingEvidence := false
 	for _, ref := range []*artifact.ObjectReference{d.EvidenceManifestRef, d.ArtifactManifestRef, d.ProvenanceRef, d.SBOMRef} {
 		if ref == nil {
@@ -145,9 +164,14 @@ func (d Decision) Validate() error {
 			continue
 		}
 		if err := ref.Validate(); err != nil {
-			return err
+			return false, err
 		}
 	}
+
+	return missingEvidence, nil
+}
+
+func (d Decision) validatePolicyMetadata() error {
 	if d.SubjectGroup != nil {
 		if err := d.SubjectGroup.Validate(); err != nil {
 			return err
@@ -166,64 +190,99 @@ func (d Decision) Validate() error {
 			return fmt.Errorf("profile applies to a different project")
 		}
 	}
-	missingMetadata := d.Build.ValidateComplete() != nil || d.SubjectGroup == nil || d.Baseline == nil || d.ProjectProfile == nil
+
+	return nil
+}
+
+type reasonFacts struct {
+	seen      map[ReasonCode]bool
+	confirmed bool
+}
+
+func (d Decision) validateReasons() (reasonFacts, error) {
 	if len(d.Reasons) == 0 {
-		return fmt.Errorf("decision reasons are required")
+		return reasonFacts{}, fmt.Errorf("decision reasons are required")
 	}
 	seen := make(map[ReasonCode]bool, len(d.Reasons))
 	confirmed := false
 	for _, reason := range d.Reasons {
 		if seen[reason] {
-			return fmt.Errorf("duplicate decision reason")
+			return reasonFacts{}, fmt.Errorf("duplicate decision reason")
 		}
 		seen[reason] = true
-		switch reason {
-		case RequiredChecksPassed:
-			if d.Verdict != Allow {
-				return fmt.Errorf("success reason requires ALLOW")
-			}
-		case ConfirmedPolicyViolation, PolicyAuthorizationViolation:
-			confirmed = true
-			if d.Verdict != Deny {
-				return fmt.Errorf("confirmed violation reason requires DENY")
-			}
-			if reason == PolicyAuthorizationViolation && d.Assessment.Trust != TrustRequirementsNotMet {
-				return fmt.Errorf("policy authorization violation requires unmet trust")
-			}
-		case MissingRequiredEvidence, MissingRequiredMetadata, EvidenceGap, ProducerFailed, InputTimeout:
-			if d.Assessment.Sufficiency != Insufficient {
-				return fmt.Errorf("missing/gap/failure reason requires insufficient inputs")
-			}
-		case UntrustedInput:
-			if d.Assessment.Trust != TrustRequirementsNotMet {
-				return fmt.Errorf("untrusted input requires unmet trust")
-			}
-		case ConsistencyMismatch:
-			if d.Assessment.Sufficiency != Insufficient || d.Assessment.Trust != TrustRequirementsNotMet {
-				return fmt.Errorf("consistency mismatch requires insufficient inputs and unmet trust")
-			}
-		case ChecksIncomplete:
-			if d.Assessment.Sufficiency != SufficiencyUnknown && d.Assessment.Compliance != ComplianceNotEvaluated && d.Assessment.Trust != TrustNotEvaluated {
-				return fmt.Errorf("incomplete checks reason requires an unestablished assessment")
-			}
-		default:
-			return fmt.Errorf("invalid decision reason")
+		if err := d.validateReason(reason); err != nil {
+			return reasonFacts{}, err
 		}
+		if reason == ConfirmedPolicyViolation || reason == PolicyAuthorizationViolation {
+			confirmed = true
+		}
+
 	}
-	if missingEvidence && (!seen[MissingRequiredEvidence] || d.Assessment.Sufficiency != Insufficient) {
+
+	return reasonFacts{seen, confirmed}, nil
+}
+
+func (d Decision) validateReason(reason ReasonCode) error {
+	switch reason {
+	case RequiredChecksPassed:
+		if d.Verdict != Allow {
+			return fmt.Errorf("success reason requires ALLOW")
+		}
+	case ConfirmedPolicyViolation, PolicyAuthorizationViolation:
+		if d.Verdict != Deny {
+			return fmt.Errorf("confirmed violation reason requires DENY")
+		}
+		if reason == PolicyAuthorizationViolation && d.Assessment.Trust != TrustRequirementsNotMet {
+			return fmt.Errorf("policy authorization violation requires unmet trust")
+		}
+	case MissingRequiredEvidence, MissingRequiredMetadata, EvidenceGap, ProducerFailed, InputTimeout:
+		if d.Assessment.Sufficiency != Insufficient {
+			return fmt.Errorf("missing/gap/failure reason requires insufficient inputs")
+		}
+	default:
+		return d.validateAssessmentReason(reason)
+	}
+	return nil
+}
+
+func (d Decision) validateAssessmentReason(reason ReasonCode) error {
+	switch reason {
+	case UntrustedInput:
+		if d.Assessment.Trust != TrustRequirementsNotMet {
+			return fmt.Errorf("untrusted input requires unmet trust")
+		}
+	case ConsistencyMismatch:
+		if d.Assessment.Sufficiency != Insufficient || d.Assessment.Trust != TrustRequirementsNotMet {
+			return fmt.Errorf("consistency mismatch requires insufficient inputs and unmet trust")
+		}
+	case ChecksIncomplete:
+		if d.Assessment.Sufficiency != SufficiencyUnknown && d.Assessment.Compliance != ComplianceNotEvaluated && d.Assessment.Trust != TrustNotEvaluated {
+			return fmt.Errorf("incomplete checks reason requires an unestablished assessment")
+		}
+	default:
+		return fmt.Errorf("invalid decision reason")
+	}
+	return nil
+}
+
+func (d Decision) validateRequiredInputs(missingEvidence, missingMetadata bool, reasons reasonFacts) error {
+	if missingEvidence && (!reasons.seen[MissingRequiredEvidence] || d.Assessment.Sufficiency != Insufficient) {
 		return fmt.Errorf("missing input references require explicit insufficiency")
 	}
-	if missingMetadata && (!seen[MissingRequiredMetadata] || d.Assessment.Sufficiency != Insufficient) {
+	if missingMetadata && (!reasons.seen[MissingRequiredMetadata] || d.Assessment.Sufficiency != Insufficient) {
 		return fmt.Errorf("missing metadata requires explicit insufficiency")
 	}
+
+	return nil
+}
+
+func (d Decision) validateVerdict(missingEvidence, missingMetadata bool, reasons reasonFacts) error {
 	allPositive := d.Assessment.Sufficiency == Sufficient && d.Assessment.Compliance == Satisfied && d.Assessment.Trust == TrustRequirementsMet
 	switch d.Verdict {
 	case Allow:
-		if !allPositive || d.ExpiresAt == nil || missingEvidence || missingMetadata || len(d.Reasons) != 1 || !seen[RequiredChecksPassed] {
-			return fmt.Errorf("contradictory or incomplete ALLOW")
-		}
+		return d.validateAllow(allPositive, missingEvidence, missingMetadata, reasons)
 	case Deny:
-		if d.Assessment.Compliance != Violated || !confirmed {
+		if d.Assessment.Compliance != Violated || !reasons.confirmed {
 			return fmt.Errorf("DENY requires a declared confirmed violation")
 		}
 	case Indeterminate:
@@ -233,5 +292,13 @@ func (d Decision) Validate() error {
 	default:
 		return fmt.Errorf("invalid verdict")
 	}
+	return nil
+}
+
+func (d Decision) validateAllow(allPositive, missingEvidence, missingMetadata bool, reasons reasonFacts) error {
+	if !allPositive || d.ExpiresAt == nil || missingEvidence || missingMetadata || len(d.Reasons) != 1 || !reasons.seen[RequiredChecksPassed] {
+		return fmt.Errorf("contradictory or incomplete ALLOW")
+	}
+
 	return nil
 }

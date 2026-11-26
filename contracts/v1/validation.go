@@ -97,43 +97,52 @@ func scanValue(dec *json.Decoder, data []byte) error {
 	}
 	switch delim {
 	case '{':
-		seen := make(map[string]bool)
-		for dec.More() {
-			keyToken, err := checkedToken(dec, data)
-			if err != nil {
-				return err
-			}
-			key, ok := keyToken.(string)
-			if !ok || !canonicalKey(key) || seen[key] {
-				return fmt.Errorf("noncanonical or duplicate JSON key")
-			}
-			seen[key] = true
-			if err := scanValue(dec, data); err != nil {
-				return err
-			}
-		}
-		end, err := dec.Token()
-		if err != nil {
-			return err
-		}
-		if end != json.Delim('}') {
-			return fmt.Errorf("expected object end")
-		}
+		return scanObject(dec, data)
 	case '[':
-		for dec.More() {
-			if err := scanValue(dec, data); err != nil {
-				return err
-			}
-		}
-		end, err := dec.Token()
-		if err != nil {
-			return err
-		}
-		if end != json.Delim(']') {
-			return fmt.Errorf("expected array end")
-		}
+		return scanArray(dec, data)
 	default:
 		return fmt.Errorf("unexpected JSON delimiter")
+	}
+}
+
+func scanObject(dec *json.Decoder, data []byte) error {
+	seen := make(map[string]bool)
+	for dec.More() {
+		keyToken, err := checkedToken(dec, data)
+		if err != nil {
+			return err
+		}
+		key, ok := keyToken.(string)
+		if !ok || !canonicalKey(key) || seen[key] {
+			return fmt.Errorf("noncanonical or duplicate JSON key")
+		}
+		seen[key] = true
+		if err := scanValue(dec, data); err != nil {
+			return err
+		}
+	}
+	end, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if end != json.Delim('}') {
+		return fmt.Errorf("expected object end")
+	}
+	return nil
+}
+
+func scanArray(dec *json.Decoder, data []byte) error {
+	for dec.More() {
+		if err := scanValue(dec, data); err != nil {
+			return err
+		}
+	}
+	end, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if end != json.Delim(']') {
+		return fmt.Errorf("expected array end")
 	}
 	return nil
 }
@@ -236,59 +245,69 @@ func ValidateBindings(w WorkflowState, e *EvidenceManifest, a *ArtifactManifest,
 		contexts = append(contexts, e.Build)
 	}
 	if a != nil {
-		if err := a.Validate(); err != nil {
+		artifactContexts, err := boundArtifactContexts(w, a)
+		if err != nil {
 			return err
 		}
-		if err := bindManifest(w, w.ArtifactInput, a.ManifestHeader); err != nil {
-			return err
-		}
-		contexts = append(contexts, a.Build)
-		if a.Payload != nil && a.Payload.Provenance != nil && a.Payload.Provenance.ClaimedBuild != nil {
-			contexts = append(contexts, *a.Payload.Provenance.ClaimedBuild)
-		}
+		contexts = append(contexts, artifactContexts...)
 	}
 	if d != nil {
-		if err := d.Validate(); err != nil {
+		if err := bindDecision(w, e, a, d); err != nil {
 			return err
 		}
-		result := d.Decision
-		if result.WorkflowID != w.WorkflowID {
-			return fmt.Errorf("decision workflow mismatch")
+		contexts = append(contexts, d.Decision.Build)
+	}
+	if err := consistentContexts(contexts); err != nil {
+		return err
+	}
+	return bindProvenanceSubjects(a, d != nil && d.Decision.Verdict == decision.Allow)
+}
+
+func bindDecisionHeader(w WorkflowState, result decision.Decision) error {
+	if result.WorkflowID != w.WorkflowID {
+		return fmt.Errorf("decision workflow mismatch")
+	}
+	if w.DecisionRef != nil && w.DecisionRef.ID != result.DecisionID {
+		return fmt.Errorf("decision ID mismatch")
+	}
+	if err := bindReference(w.EvidenceInput.ManifestRef, result.EvidenceManifestRef); err != nil {
+		return err
+	}
+	if err := bindReference(w.ArtifactInput.ManifestRef, result.ArtifactManifestRef); err != nil {
+		return err
+	}
+	return nil
+}
+
+func bindAllowManifests(e *EvidenceManifest, a *ArtifactManifest, verdict decision.Verdict) error {
+	if verdict == decision.Allow {
+		if e == nil || a == nil || e.State != Finalized || a.State != Finalized {
+			return fmt.Errorf("ALLOW binding requires both finalized manifests")
 		}
-		if w.DecisionRef != nil && w.DecisionRef.ID != result.DecisionID {
-			return fmt.Errorf("decision ID mismatch")
-		}
-		contexts = append(contexts, result.Build)
-		if err := bindReference(w.EvidenceInput.ManifestRef, result.EvidenceManifestRef); err != nil {
+		if err := e.Build.ValidateComplete(); err != nil {
 			return err
 		}
-		if err := bindReference(w.ArtifactInput.ManifestRef, result.ArtifactManifestRef); err != nil {
+		if err := a.Build.ValidateComplete(); err != nil {
 			return err
-		}
-		if result.Verdict == decision.Allow {
-			if e == nil || a == nil || e.State != Finalized || a.State != Finalized {
-				return fmt.Errorf("ALLOW binding requires both finalized manifests")
-			}
-			if err := e.Build.ValidateComplete(); err != nil {
-				return err
-			}
-			if err := a.Build.ValidateComplete(); err != nil {
-				return err
-			}
-		}
-		if a != nil && a.Payload != nil {
-			p := a.Payload
-			if result.SubjectGroup != nil && !result.SubjectGroup.Equal(p.SubjectGroup) {
-				return fmt.Errorf("subject group mismatch")
-			}
-			if result.SBOMRef != nil && (p.SBOMRef == nil || !p.SBOMRef.Equal(*result.SBOMRef)) {
-				return fmt.Errorf("SBOM reference mismatch")
-			}
-			if result.ProvenanceRef != nil && (p.Provenance == nil || !p.Provenance.Reference.Equal(*result.ProvenanceRef)) {
-				return fmt.Errorf("provenance reference mismatch")
-			}
 		}
 	}
+	return nil
+}
+
+func bindDecisionArtifacts(p *ArtifactPayload, result decision.Decision) error {
+	if result.SubjectGroup != nil && !result.SubjectGroup.Equal(p.SubjectGroup) {
+		return fmt.Errorf("subject group mismatch")
+	}
+	if result.SBOMRef != nil && (p.SBOMRef == nil || !p.SBOMRef.Equal(*result.SBOMRef)) {
+		return fmt.Errorf("SBOM reference mismatch")
+	}
+	if result.ProvenanceRef != nil && (p.Provenance == nil || !p.Provenance.Reference.Equal(*result.ProvenanceRef)) {
+		return fmt.Errorf("provenance reference mismatch")
+	}
+	return nil
+}
+
+func consistentContexts(contexts []build.Context) error {
 	for i, c := range contexts {
 		for _, other := range contexts[i+1:] {
 			if !c.Consistent(other) {
@@ -296,20 +315,59 @@ func ValidateBindings(w WorkflowState, e *EvidenceManifest, a *ArtifactManifest,
 			}
 		}
 	}
-	if a != nil && a.Payload != nil && a.Payload.Provenance != nil {
-		p := a.Payload
-		claims := make(map[string]artifact.Digest, len(p.Provenance.Subjects))
-		for _, s := range p.Provenance.Subjects {
-			claims[s.Name] = s.Digest
+	return nil
+}
+
+func bindProvenanceSubjects(a *ArtifactManifest, allow bool) error {
+	if a == nil || a.Payload == nil || a.Payload.Provenance == nil {
+		return nil
+	}
+	p := a.Payload
+	claims := make(map[string]artifact.Digest, len(p.Provenance.Subjects))
+	for _, s := range p.Provenance.Subjects {
+		claims[s.Name] = s.Digest
+	}
+	for _, s := range p.SubjectGroup.Subjects {
+		claim, exists := claims[s.Name]
+		if exists && claim != s.Digest {
+			return fmt.Errorf("provenance subject digest mismatch")
 		}
-		for _, s := range p.SubjectGroup.Subjects {
-			claim, exists := claims[s.Name]
-			if exists && claim != s.Digest {
-				return fmt.Errorf("provenance subject digest mismatch")
-			}
-			if !exists && d != nil && d.Decision.Verdict == decision.Allow {
-				return fmt.Errorf("ALLOW subject missing from provenance claims")
-			}
+		if !exists && allow {
+			return fmt.Errorf("ALLOW subject missing from provenance claims")
+		}
+	}
+	return nil
+}
+
+func boundArtifactContexts(w WorkflowState, a *ArtifactManifest) ([]build.Context, error) {
+	var contexts []build.Context
+	if err := a.Validate(); err != nil {
+		return nil, err
+	}
+	if err := bindManifest(w, w.ArtifactInput, a.ManifestHeader); err != nil {
+		return nil, err
+	}
+	contexts = append(contexts, a.Build)
+	if a.Payload != nil && a.Payload.Provenance != nil && a.Payload.Provenance.ClaimedBuild != nil {
+		contexts = append(contexts, *a.Payload.Provenance.ClaimedBuild)
+	}
+	return contexts, nil
+}
+
+func bindDecision(w WorkflowState, e *EvidenceManifest, a *ArtifactManifest, d *DecisionRecord) error {
+	if err := d.Validate(); err != nil {
+		return err
+	}
+	result := d.Decision
+	if err := bindDecisionHeader(w, result); err != nil {
+		return err
+	}
+	if err := bindAllowManifests(e, a, result.Verdict); err != nil {
+		return err
+	}
+	if a != nil && a.Payload != nil {
+		if err := bindDecisionArtifacts(a.Payload, result); err != nil {
+			return err
 		}
 	}
 	return nil

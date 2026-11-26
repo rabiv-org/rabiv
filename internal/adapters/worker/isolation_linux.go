@@ -14,8 +14,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -24,6 +22,7 @@ import (
 
 	"github.com/rabiv-org/rabiv/internal/app/acquire"
 	"github.com/rabiv-org/rabiv/internal/platform/jsoninput"
+	"github.com/rabiv-org/rabiv/internal/platform/process"
 )
 
 var ErrIsolation = errors.New("worker isolation preflight failed")
@@ -56,36 +55,61 @@ func canonical(p string) bool {
 }
 func within(a, b string) bool { return a == b || strings.HasPrefix(a, b+"/") }
 func (c Config) Validate() error {
-	if c.UID <= 0 || c.GID <= 0 || c.FetchReaderGID <= 0 || c.ResultReaderGID <= 0 || c.FetchReaderGID == c.GID || c.ResultReaderGID == c.GID || c.FetchReaderGID == c.ResultReaderGID || c.HostNetNS == 0 || c.MemoryBytes < 128<<20 || c.CPUPercent <= 0 || c.CPUPercent > 400 || c.Tasks < 8 || c.Tasks > 512 || c.TimeoutSeconds <= 0 || c.TimeoutSeconds > 3600 || len(c.CredentialPaths) == 0 {
+	if !c.validIdentity() || !c.validLimits() || len(c.CredentialPaths) == 0 {
 		return ErrIsolation
 	}
 	paths := []string{c.FetchRoot, c.ResultRoot, c.Workspace, c.Executable, c.SyftBinary}
 	for _, p := range paths {
-		if !canonical(p) || within(p, "/home") || within(p, "/root") || within(p, "/tmp") || within(p, "/var/tmp") || within(p, "/run") || within(p, "/var/run") {
+		if !visibleWorkerPath(p) {
 			return ErrIsolation
 		}
 	}
-	for _, p := range append([]string{c.DecisionRoot}, c.CredentialPaths...) {
+	protected := append([]string{c.DecisionRoot}, c.CredentialPaths...)
+	for _, p := range protected {
 		if !canonical(p) {
 			return ErrIsolation
 		}
-		for _, allowed := range paths {
-			if within(allowed, p) || within(p, allowed) {
-				return ErrIsolation
-			}
-		}
 	}
-	for _, w := range []string{c.Workspace, c.ResultRoot} {
-		for _, r := range append([]string{c.FetchRoot, c.Executable, c.SyftBinary, c.DecisionRoot}, c.CredentialPaths...) {
-			if within(w, r) || within(r, w) {
-				return ErrIsolation
-			}
-		}
+	if !disjoint(paths, protected) {
+		return ErrIsolation
+	}
+	readOnly := append([]string{c.FetchRoot, c.Executable, c.SyftBinary, c.DecisionRoot}, c.CredentialPaths...)
+	if !disjoint([]string{c.Workspace, c.ResultRoot}, readOnly) {
+		return ErrIsolation
 	}
 	if within(c.Workspace, c.ResultRoot) || within(c.ResultRoot, c.Workspace) {
 		return ErrIsolation
 	}
 	return nil
+}
+
+func visibleWorkerPath(p string) bool {
+	if !canonical(p) {
+		return false
+	}
+	for _, hidden := range []string{"/home", "/root", "/tmp", "/var/tmp", "/run", "/var/run"} {
+		if within(p, hidden) {
+			return false
+		}
+	}
+	return true
+}
+
+func (c Config) validIdentity() bool {
+	return c.UID > 0 && c.GID > 0 && c.FetchReaderGID > 0 && c.ResultReaderGID > 0 && c.FetchReaderGID != c.GID && c.ResultReaderGID != c.GID && c.FetchReaderGID != c.ResultReaderGID && c.HostNetNS != 0
+}
+func (c Config) validLimits() bool {
+	return c.MemoryBytes >= 128<<20 && c.CPUPercent > 0 && c.CPUPercent <= 400 && c.Tasks >= 8 && c.Tasks <= 512 && c.TimeoutSeconds > 0 && c.TimeoutSeconds <= 3600
+}
+func disjoint(a, b []string) bool {
+	for _, x := range a {
+		for _, y := range b {
+			if within(x, y) || within(y, x) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // trusted opens through only root-owned, non-writable, nonsymlink ancestors.
@@ -195,59 +219,23 @@ func netNS() (uint64, error) {
 // different network namespace and read-only Fetch mount. It is defense in depth,
 // not a standalone proof of every systemd property. Root/host admin is trusted.
 func (c Config) Check() error {
-	if c.Validate() != nil || os.Getuid() != c.UID || os.Geteuid() != c.UID || os.Getgid() != c.GID || os.Getegid() != c.GID {
+	if c.Validate() != nil {
 		return ErrIsolation
 	}
-	groups, e := os.Getgroups()
-	if e != nil {
+	if process.CheckIdentity(c.UID, c.GID, []int{c.FetchReaderGID, c.ResultReaderGID}) != nil {
 		return ErrIsolation
 	}
-	expected := []int{c.FetchReaderGID, c.ResultReaderGID}
-	for _, g := range groups {
-		if g != c.GID && !slices.Contains(expected, g) {
-			return ErrIsolation
-		}
+	if err := c.checkSandbox(); err != nil {
+		return err
 	}
-	for _, g := range expected {
-		if !slices.Contains(groups, g) {
-			return ErrIsolation
-		}
-	}
-	status, e := os.ReadFile("/proc/self/status")
-	if e != nil {
+	if !validWorkerEnvironment(os.Environ()) {
 		return ErrIsolation
 	}
-	fields := map[string]string{}
-	for _, line := range strings.Split(string(status), "\n") {
-		k, v, ok := strings.Cut(line, ":")
-		if ok {
-			fields[k] = strings.TrimSpace(v)
-		}
-	}
-	for _, k := range []string{"CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"} {
-		v, e := strconv.ParseUint(fields[k], 16, 64)
-		if e != nil || v != 0 {
-			return ErrIsolation
-		}
-	}
-	if fields["NoNewPrivs"] != "1" {
-		return ErrIsolation
-	}
-	for _, k := range []string{"Uid", "Gid"} {
-		values := strings.Fields(fields[k])
-		if len(values) != 4 {
-			return ErrIsolation
-		}
-		want := c.UID
-		if k == "Gid" {
-			want = c.GID
-		}
-		for _, v := range values {
-			if v != strconv.Itoa(want) {
-				return ErrIsolation
-			}
-		}
-	}
+
+	return nil
+}
+
+func (c Config) checkSandbox() error {
 	ns, e := netNS()
 	if e != nil || ns == c.HostNetNS {
 		return ErrIsolation
@@ -256,6 +244,21 @@ func (c Config) Check() error {
 	if e != nil || !i.IsDir() || i.Mode().Perm() != 0700 || int(i.Sys().(*syscall.Stat_t).Uid) != c.UID {
 		return ErrIsolation
 	}
+	if err := c.checkMounts(); err != nil {
+		return err
+	}
+	for _, p := range append([]string{c.DecisionRoot}, c.CredentialPaths...) {
+		f, e := os.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		if e == nil {
+			_ = f.Close()
+			return ErrIsolation
+		}
+	}
+
+	return nil
+}
+
+func (c Config) checkMounts() error {
 	var stat syscall.Statfs_t
 	if syscall.Statfs(c.FetchRoot, &stat) != nil || stat.Flags&syscall.MS_RDONLY == 0 {
 		return ErrIsolation
@@ -271,21 +274,19 @@ func (c Config) Check() error {
 	if _, err := os.Lstat("/run/systemd/private"); !errors.Is(err, os.ErrNotExist) {
 		return ErrIsolation
 	}
-	for _, p := range append([]string{c.DecisionRoot}, c.CredentialPaths...) {
-		f, e := os.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0)
-		if e == nil {
-			_ = f.Close()
-			return ErrIsolation
-		}
-	}
-	for _, entry := range os.Environ() {
+
+	return nil
+}
+
+func validWorkerEnvironment(entries []string) bool {
+	for _, entry := range entries {
 		key, _, _ := strings.Cut(entry, "=")
 		key = strings.ToUpper(key)
 		if strings.Contains(key, "TOKEN") || strings.Contains(key, "PASSWORD") || strings.HasPrefix(key, "GIT_") || key == "SSH_AUTH_SOCK" {
-			return ErrIsolation
+			return false
 		}
 	}
-	return nil
+	return true
 }
 
 // Launch requires explicit owner execution as root and reviewed root-owned
@@ -296,6 +297,7 @@ func Launch(ctx context.Context, profile string, args []string) ([]byte, error) 
 	return launch(ctx, profile, args, unit, marker)
 }
 
+//nolint:gocognit,gocyclo // Keep privileged start and bounded ownership-aware recovery in their required order.
 func launch(ctx context.Context, profile string, args []string, unit, marker string) ([]byte, error) {
 	if os.Getuid() != 0 || os.Geteuid() != 0 {
 		return nil, ErrIsolation

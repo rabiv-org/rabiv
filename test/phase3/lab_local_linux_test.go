@@ -2,11 +2,13 @@ package phase3_test
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestGoTimeoutRequiresExternalRecovery(t *testing.T) {
@@ -15,7 +17,10 @@ func TestGoTimeoutRequiresExternalRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(exe, "-test.run=^TestLegacyTimeoutChild$", "-test.timeout=100ms")
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, exe, "-test.run=^TestLegacyTimeoutChild$", "-test.timeout=100ms")
+	cmd.WaitDelay = time.Second
 	cmd.Env = []string{"PATH=/usr/bin:/bin", "RABIV_PRIVATE_TIMEOUT_MARKER=" + path}
 	output, err := cmd.CombinedOutput()
 	if err == nil || !bytes.Contains(output, []byte("test timed out")) {
@@ -38,7 +43,10 @@ func TestLegacyTimeoutChild(t *testing.T) {
 
 // These tests mock account/systemd commands. They never run the VM entry point.
 func TestVMLabLocalRegressions(t *testing.T) {
-	cmd := exec.Command("/usr/bin/python3", "-B", "vm_lab_test.py")
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/usr/bin/python3", "-B", "vm_lab_test.py")
+	cmd.WaitDelay = time.Second
 	cmd.Env = []string{"PATH=/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE=1"}
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("unprivileged VM harness regressions: %v\n%s", err, output)

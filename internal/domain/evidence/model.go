@@ -169,6 +169,30 @@ func (b Bundle) Validate() error {
 	if err := b.EventLoss.Validate(); err != nil {
 		return err
 	}
+	observed, err := b.validateObservations()
+	if err != nil {
+		return err
+	}
+	hasAttributionGap, err := b.validateGaps()
+	if err != nil {
+		return err
+	}
+	return b.validateCoverage(observed, hasAttributionGap)
+}
+
+func (b Bundle) validateCoverage(observed map[string]bool, hasAttributionGap bool) error {
+	if (len(b.Scopes) == 0 || len(b.Observations) == 0) && !hasAttributionGap {
+		return fmt.Errorf("missing scope/source metadata requires an attribution gap")
+	}
+	if b.Coverage.Status == CoverageClaimedComplete {
+		if len(b.Scopes) == 0 || len(observed) != len(b.Scopes) || len(b.Gaps) != 0 || b.EventLoss.Status != NoLossReported {
+			return fmt.Errorf("complete claim contradicts missing metadata, loss, or gaps")
+		}
+	}
+	return nil
+}
+
+func (b Bundle) validateObservations() (map[string]bool, error) {
 	scopes := make(map[string]bool, len(b.Scopes))
 	for _, s := range b.Scopes {
 		scopes[s.ScopeID] = true
@@ -178,35 +202,33 @@ func (b Bundle) Validate() error {
 	observed := make(map[string]bool, len(b.Scopes))
 	for _, o := range b.Observations {
 		if err := o.Validate(); err != nil {
-			return err
+			return nil, err
 		}
 		key := pair{o.ScopeID, o.EventSource}
 		if !scopes[o.ScopeID] || seen[key] {
-			return fmt.Errorf("unknown scope or duplicate observation")
+			return nil, fmt.Errorf("unknown scope or duplicate observation")
 		}
 		seen[key], observed[o.ScopeID] = true, true
 	}
+
+	return observed, nil
+}
+
+func (b Bundle) validateGaps() (bool, error) {
 	hasAttributionGap := false
 	seenGaps := make(map[GapCode]bool, len(b.Gaps))
 	for _, g := range b.Gaps {
 		if err := g.Validate(); err != nil {
-			return err
+			return false, err
 		}
 		if seenGaps[g.Code] {
-			return fmt.Errorf("duplicate gap")
+			return false, fmt.Errorf("duplicate gap")
 		}
 		seenGaps[g.Code] = true
 		if g.Code == UnresolvedScope || g.Code == AmbiguousScope || g.Code == ScopeMetadataUnavailable {
 			hasAttributionGap = true
 		}
 	}
-	if (len(b.Scopes) == 0 || len(b.Observations) == 0) && !hasAttributionGap {
-		return fmt.Errorf("missing scope/source metadata requires an attribution gap")
-	}
-	if b.Coverage.Status == CoverageClaimedComplete {
-		if len(b.Scopes) == 0 || len(observed) != len(scopes) || len(b.Gaps) != 0 || b.EventLoss.Status != NoLossReported {
-			return fmt.Errorf("complete claim contradicts missing metadata, loss, or gaps")
-		}
-	}
-	return nil
+
+	return hasAttributionGap, nil
 }

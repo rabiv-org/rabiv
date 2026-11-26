@@ -4,9 +4,9 @@ package correlate
 
 import (
 	"errors"
-	"strings"
 	"time"
 
+	"github.com/rabiv-org/rabiv/internal/domain/artifact"
 	"github.com/rabiv-org/rabiv/internal/domain/build"
 	"github.com/rabiv-org/rabiv/internal/domain/evidence"
 	"github.com/rabiv-org/rabiv/internal/platform/jsoninput"
@@ -84,42 +84,17 @@ type Capture struct {
 
 // Validate checks metadata, never resource admission, coverage or identity trust.
 func (c Capture) Validate() error {
-	validToken := func(s string) bool {
-		if s == "" || len(s) > 128 {
-			return false
-		}
-		for _, r := range s {
-			if !strings.ContainsRune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-", r) {
-				return false
-			}
-		}
-		return true
-	}
-	if c.Version != "runtime-capture/v1" || !validToken(c.CaptureID) || !validToken(c.HostID) || !validToken(c.BootID) || c.Window.Validate() != nil || c.Containers == nil || c.Events == nil || c.Gaps == nil || c.Diagnostics == nil {
+	if c.Version != "runtime-capture/v1" || artifact.ValidateID(c.CaptureID) != nil || artifact.ValidateID(c.HostID) != nil || artifact.ValidateID(c.BootID) != nil || c.Window.Validate() != nil || c.Containers == nil || c.Events == nil || c.Gaps == nil || c.Diagnostics == nil {
 		return errors.New("invalid runtime capture")
 	}
 	for _, v := range c.Containers {
-		if (build.ContainerIdentity{Runtime: "DOCKER", CanonicalID: v.ID}).Validate() != nil || build.ValidateTime(v.At) != nil {
-			return errors.New("invalid container observation")
-		}
-		if v.StartedAt != nil && build.ValidateTime(*v.StartedAt) != nil || v.FinishedAt != nil && build.ValidateTime(*v.FinishedAt) != nil || v.StartedAt != nil && v.FinishedAt != nil && v.FinishedAt.Before(*v.StartedAt) {
-			return errors.New("invalid runtime state timestamps")
+		if err := v.validate(); err != nil {
+			return err
 		}
 	}
 	for _, v := range c.Events {
-		if build.ValidateTime(v.At) != nil || v.Source == "" || len(v.ExecID) > MaxExecIDBytes || len(v.ParentExecID) > MaxExecIDBytes {
-			return errors.New("invalid runtime event")
-		}
-		if v.ContainerID != "" && (build.ObservedContainerID{Runtime: "DOCKER", Value: v.ContainerID}).Validate() != nil {
-			return errors.New("invalid observed container ID")
-		}
-		switch v.Kind {
-		case ProcessExec, ProcessExit, FileWriteIntent, TCPConnect, Unsupported, SourceLoss:
-		default:
-			return errors.New("unsupported normalized event kind")
-		}
-		if v.Kind == SourceLoss && v.LossCount == nil || v.Kind != SourceLoss && v.LossCount != nil {
-			return errors.New("invalid source loss report")
+		if err := v.validate(); err != nil {
+			return err
 		}
 	}
 	for _, g := range c.Gaps {
@@ -151,4 +126,32 @@ func DecodeAndResolve(data []byte, limit int64, targets []build.Context) (Captur
 	}
 	r, err := resolve(c, targets)
 	return c, r, err
+}
+
+func (v Container) validate() error {
+	if (build.ContainerIdentity{Runtime: "DOCKER", CanonicalID: v.ID}).Validate() != nil || build.ValidateTime(v.At) != nil {
+		return errors.New("invalid container observation")
+	}
+	if v.StartedAt != nil && build.ValidateTime(*v.StartedAt) != nil || v.FinishedAt != nil && build.ValidateTime(*v.FinishedAt) != nil || v.StartedAt != nil && v.FinishedAt != nil && v.FinishedAt.Before(*v.StartedAt) {
+		return errors.New("invalid runtime state timestamps")
+	}
+	return nil
+}
+
+func (v Event) validate() error {
+	if build.ValidateTime(v.At) != nil || v.Source == "" || len(v.ExecID) > MaxExecIDBytes || len(v.ParentExecID) > MaxExecIDBytes {
+		return errors.New("invalid runtime event")
+	}
+	if v.ContainerID != "" && (build.ObservedContainerID{Runtime: "DOCKER", Value: v.ContainerID}).Validate() != nil {
+		return errors.New("invalid observed container ID")
+	}
+	switch v.Kind {
+	case ProcessExec, ProcessExit, FileWriteIntent, TCPConnect, Unsupported, SourceLoss:
+	default:
+		return errors.New("unsupported normalized event kind")
+	}
+	if v.Kind == SourceLoss && v.LossCount == nil || v.Kind != SourceLoss && v.LossCount != nil {
+		return errors.New("invalid source loss report")
+	}
+	return nil
 }

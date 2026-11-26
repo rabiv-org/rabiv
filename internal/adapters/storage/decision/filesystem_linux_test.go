@@ -66,7 +66,8 @@ func TestPrivateStagingAndDurableOrdering(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if !info.IsDir() {
+		switch {
+		case !info.IsDir():
 			stages = append(stages, "file")
 			if info.Mode().Perm() != 0440 || len(temps) != 1 || len(finals) != 0 {
 				return fmt.Errorf("file metadata/visibility ordering violated")
@@ -75,11 +76,11 @@ func TestPrivateStagingAndDurableOrdering(t *testing.T) {
 			if err != nil || !bytes.Equal(got, payload) {
 				return fmt.Errorf("incomplete staged bytes: %w", err)
 			}
-		} else if len(temps) == 1 && len(finals) == 1 {
+		case len(temps) == 1 && len(finals) == 1:
 			stages = append(stages, "committed directory")
-		} else if len(temps) == 0 && len(finals) == 1 {
+		case len(temps) == 0 && len(finals) == 1:
 			stages = append(stages, "staging directory")
-		} else {
+		default:
 			return fmt.Errorf("directory sync ordering violated")
 		}
 		return f.Sync()
@@ -93,6 +94,31 @@ func TestPrivateStagingAndDurableOrdering(t *testing.T) {
 	got, err := s.read(context.Background(), "d-1")
 	if err != nil || !bytes.Equal(got, payload) {
 		t.Fatal("committed read", err)
+	}
+}
+
+func TestDecisionCancellationAfterVisibilityFinishesDurability(t *testing.T) {
+	s := functionalStore(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	calls := 0
+	s.syncFile = func(f *os.File) error {
+		calls++
+		info, err := f.Stat()
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			cancel()
+		}
+		return f.Sync()
+	}
+	if err := s.putBytes(ctx, "cancel-after-link", []byte("complete")); err != nil || ctx.Err() == nil || calls != 3 {
+		t.Fatalf("durability interrupted: calls=%d err=%v", calls, err)
+	}
+	data, err := s.read(context.Background(), "cancel-after-link")
+	if err != nil || string(data) != "complete" {
+		t.Fatalf("committed decision lost: %v", err)
 	}
 }
 

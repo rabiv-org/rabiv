@@ -59,6 +59,7 @@ type streamPump[T any] struct {
 	discarded bool
 }
 
+//nolint:gocognit // Keep cancellation-aware final delivery and stream termination in one ordered pump.
 func pump[T any](ctx context.Context, wg *sync.WaitGroup, next func() (T, error)) *streamPump[T] {
 	s := &streamPump[T]{records: make(chan message[T], 64)}
 	wg.Go(func() {
@@ -163,6 +164,8 @@ type captureState struct {
 
 // observe serializes evidence updates and permits only one outstanding inventory
 // request. Cancellation and reader joining remain owned by Capture.
+//
+//nolint:gocognit // One select owns evidence updates and the single outstanding inventory request.
 func (s *captureState) observe(ctx context.Context, docker Docker, containers <-chan message[correlate.Container], events <-chan message[correlate.Event], inventories chan message[[]correlate.Container], wg *sync.WaitGroup) {
 	query := func() {
 		wg.Go(func() {

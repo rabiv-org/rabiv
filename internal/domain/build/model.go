@@ -42,28 +42,28 @@ func canonicalInstance(s string) bool {
 	if err != nil || u.Opaque != "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || strings.ContainsRune(s, '#') {
 		return false
 	}
+	return canonicalAuthority(u) && canonicalInstancePath(u, s) && u.String() == s
+}
+
+func canonicalAuthority(u *url.URL) bool {
 	if u.Scheme != "http" && u.Scheme != "https" || u.Host == "" || u.Host != strings.ToLower(u.Host) || u.Hostname() == "" {
 		return false
 	}
-	if u.Port() == "80" && u.Scheme == "http" || u.Port() == "443" && u.Scheme == "https" {
-		return false
-	}
-	if strings.HasSuffix(u.Host, ":") || strings.ContainsAny(s, "\\\t\r\n ") {
-		return false
-	}
-	if u.RawPath != "" || strings.Contains(s, "%") || strings.HasSuffix(u.Path, "/") {
-		return false
-	}
-	if u.Path != "" && path.Clean(u.Path) != u.Path {
+	if u.Port() == "80" && u.Scheme == "http" || u.Port() == "443" && u.Scheme == "https" || strings.HasSuffix(u.Host, ":") {
 		return false
 	}
 	if p := u.Port(); p != "" {
 		n, err := strconv.Atoi(p)
-		if err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != p {
-			return false
-		}
+		return err == nil && n >= 1 && n <= 65535 && strconv.Itoa(n) == p
 	}
-	return u.String() == s
+	return true
+}
+
+func canonicalInstancePath(u *url.URL, s string) bool {
+	if strings.ContainsAny(s, "\\\t\r\n ") || u.RawPath != "" || strings.Contains(s, "%") || strings.HasSuffix(u.Path, "/") {
+		return false
+	}
+	return u.Path == "" || path.Clean(u.Path) == u.Path
 }
 
 // Validate checks metadata syntax, not provider or project ownership.

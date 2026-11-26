@@ -8,6 +8,10 @@ Required:
 - Git
 - golangci-lint v2.15.0
 
+Default tests additionally require Bash and `/usr/bin/python3` (standard library
+only). The Python harness uses temporary fixtures and mocks privileged commands;
+it is already invoked by the Go suite.
+
 Optional:
 - GNU Make
 - VS Code / GoLand
@@ -49,6 +53,23 @@ make build
 
 Full local checks:
 make check
+
+Native coverage with race detection (informational, no minimum percentage):
+make test-cover
+
+The ignored `coverage.out` profile can be overridden with `COVERPROFILE`.
+`go tool cover -html=coverage.out` can inspect the same profile locally.
+
+Standalone harness diagnosis:
+make test-python
+
+Shell syntax only, without privileged execution:
+make shell-check
+
+`make check` runs both default and opt-in lint profiles. CI uses one race/coverage
+test invocation; the Go wrapper runs Python regressions within that invocation.
+Do not add a second harness run to CI. Tagged compile/vet/lint checks do not
+execute VM or credential-dependent integration tests.
 
 Vulnerability check:
 make vuln

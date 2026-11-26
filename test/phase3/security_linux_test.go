@@ -38,11 +38,13 @@ type vmConfig struct {
 }
 
 func vmEnvironment() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	b, e := os.ReadFile("/etc/os-release")
 	if e != nil || !bytes.Contains(b, []byte("ID=ubuntu")) || !bytes.Contains(b, []byte("VERSION_ID=\"24.04\"")) {
 		return false
 	}
-	out, e := exec.Command("/usr/bin/systemd-detect-virt", "--vm").Output()
+	out, e := exec.CommandContext(ctx, "/usr/bin/systemd-detect-virt", "--vm").Output()
 	return e == nil && (strings.TrimSpace(string(out)) == "kvm" || strings.TrimSpace(string(out)) == "qemu")
 }
 func rootRegular(path string) bool {
@@ -259,7 +261,9 @@ func TestVMPhase3(t *testing.T) {
 	if !rootRegular(syft) {
 		t.Fatal("root-owned Syft binary required")
 	}
-	fs, e := exec.Command("findmnt", "-n", "-o", "FSTYPE", "-T", "/var/lib").Output()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	fs, e := exec.CommandContext(ctx, "findmnt", "-n", "-o", "FSTYPE", "-T", "/var/lib").Output()
 	if e != nil || strings.TrimSpace(string(fs)) != "ext4" {
 		t.Fatal("guest ext4 required before mutation")
 	}

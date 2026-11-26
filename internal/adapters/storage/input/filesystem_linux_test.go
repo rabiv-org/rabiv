@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +21,53 @@ import (
 	"github.com/rabiv-org/rabiv/internal/domain/build"
 	"github.com/rabiv-org/rabiv/internal/domain/evidence"
 )
+
+type failedReader struct{ err error }
+
+func (r failedReader) Read([]byte) (int, error) { return 0, r.err }
+
+func TestReadFailureKeepsInputPrivateAndCleansStage(t *testing.T) {
+	s := fixture(t)
+	injected := errors.New("injected input read failure")
+	_, err := s.Put(t.Context(), "failed", io.MultiReader(strings.NewReader("partial"), failedReader{injected}), 1024)
+	if !errors.Is(err, injected) || errors.Is(err, ErrCommitUncertain) {
+		t.Fatalf("read failure classification: %v", err)
+	}
+	staged, err := fs.ReadDir(s.staging.FS(), ".")
+	if err != nil || len(staged) != 0 {
+		t.Fatalf("private stage leaked: %v", err)
+	}
+	finals, err := fs.ReadDir(s.committed.FS(), ".")
+	if err != nil || len(finals) != 0 {
+		t.Fatalf("failed read became visible: %v", err)
+	}
+}
+
+func TestInputCancellationAfterVisibilityFinishesDurability(t *testing.T) {
+	s := fixture(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	calls := 0
+	s.sync = func(f *os.File) error {
+		calls++
+		info, err := f.Stat()
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			cancel()
+		}
+		return f.Sync()
+	}
+	ref, err := s.Put(ctx, "cancel-after-link", strings.NewReader("complete"), 1024)
+	if err != nil || ctx.Err() == nil || calls != 3 {
+		t.Fatalf("durability interrupted: calls=%d err=%v", calls, err)
+	}
+	data, err := s.Get(context.Background(), ref, 1024)
+	if err != nil || string(data) != "complete" {
+		t.Fatalf("committed snapshot lost: %v", err)
+	}
+}
 
 func TestCollectorEnvelopeSnapshotsReadableAtConsumerLimits(t *testing.T) {
 	// Real files and hashing, same-UID functional layout; not OS authorization.

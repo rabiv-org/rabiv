@@ -51,8 +51,8 @@ type Store struct {
 }
 
 func (c Config) validate(writer bool) error {
-	if !filepath.IsAbs(c.RootDir) || filepath.Clean(c.RootDir) != c.RootDir || c.RootDir == "/" || c.WriterUID < 0 || c.ReaderUID <= 0 || c.WriterUID == c.ReaderUID || c.WriterGID < 0 || c.ReaderPrimaryGID <= 0 || c.ReaderGID <= 0 || c.ReaderGID == c.WriterGID || c.ReaderGID == c.ReaderPrimaryGID {
-		return ErrUnsafe
+	if err := c.validateLayout(); err != nil {
+		return err
 	}
 	u, g := c.ReaderUID, c.ReaderPrimaryGID
 	if writer {
@@ -71,6 +71,14 @@ func (c Config) validate(writer bool) error {
 		}
 	}
 	return ErrUnsafe
+}
+
+func (c Config) validateLayout() error {
+	if !filepath.IsAbs(c.RootDir) || filepath.Clean(c.RootDir) != c.RootDir || c.RootDir == "/" || c.WriterUID < 0 || c.ReaderUID <= 0 || c.WriterUID == c.ReaderUID || c.WriterGID < 0 || c.ReaderPrimaryGID <= 0 || c.ReaderGID <= 0 || c.ReaderGID == c.WriterGID || c.ReaderGID == c.ReaderPrimaryGID {
+		return ErrUnsafe
+	}
+
+	return nil
 }
 
 // OpenWriter checks actual credentials and trusted directory descriptors.
@@ -331,28 +339,12 @@ func (s *Store) Put(ctx context.Context, id string, src io.Reader, limit int64) 
 		return zero, err
 	}
 	defer func() { _ = s.staging.Remove(tmp) }()
-	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(src, limit+1))
-	if err == nil && n > limit {
-		err = errors.New("input object too large")
-	}
-	if err == nil {
-		err = ctx.Err()
-	}
-	if err == nil {
-		err = f.Chown(-1, s.cfg.ReaderGID)
-	}
-	if err == nil {
-		err = f.Chmod(0440)
-	}
-	if err == nil {
-		err = s.sync(f)
-	}
-	err = errors.Join(err, f.Close())
+	digest, n, stageErr := s.writeStaged(ctx, f, src, limit)
+	err = errors.Join(stageErr, f.Close())
 	if err != nil {
 		return zero, err
 	}
-	ref := artifact.ObjectReference{ID: id, Digest: artifact.Digest{Algorithm: "sha256", Value: hex.EncodeToString(h.Sum(nil))}}
+	ref := artifact.ObjectReference{ID: id, Digest: digest}
 	err = s.root.Link("staging/"+tmp, "committed/"+name)
 	if errors.Is(err, os.ErrExist) {
 		if err := s.verifyRetry(ctx, name, n, ref.Digest); err != nil {
@@ -371,4 +363,26 @@ func (s *Store) Put(ctx context.Context, id string, src io.Reader, limit int64) 
 		return zero, fmt.Errorf("%w: synchronization or private cleanup failed", ErrCommitUncertain)
 	}
 	return ref, nil
+}
+
+func (s *Store) writeStaged(ctx context.Context, f *os.File, src io.Reader, limit int64) (artifact.Digest, int64, error) {
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(src, limit+1))
+	if err == nil && n > limit {
+		err = errors.New("input object too large")
+	}
+	if err == nil {
+		err = ctx.Err()
+	}
+	if err == nil {
+		err = f.Chown(-1, s.cfg.ReaderGID)
+	}
+	if err == nil {
+		err = f.Chmod(0440)
+	}
+	if err == nil {
+		err = s.sync(f)
+	}
+
+	return artifact.Digest{Algorithm: "sha256", Value: hex.EncodeToString(h.Sum(nil))}, n, err
 }

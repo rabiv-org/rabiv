@@ -13,7 +13,8 @@ import (
 
 func TestReadOnlyUnixAPIAndSubscriptionHeaders(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "engine.sock")
-	listener, err := net.Listen("unix", socket)
+	var listen net.ListenConfig
+	listener, err := listen.Listen(t.Context(), "unix", socket)
 	if err != nil {
 		t.Fatal(err)
 	}

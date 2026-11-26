@@ -47,8 +47,11 @@ jobs:
       - name: Vet opt-in tests
         run: go vet -tags=rabiv_integration,rabiv_vmtest ./...
 
-      - name: Race tests
-        run: go test -race ./...
+      - name: Shell syntax (no script execution)
+        run: make shell-check
+
+      - name: Race tests and native coverage
+        run: make test-cover
 
       - name: Build
         run: go build ./...
@@ -71,8 +74,14 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
-      - name: golangci-lint
+      - name: Lint default profile
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version-file: .golangci-lint-version
-          args: --build-tags=rabiv_integration,rabiv_vmtest
+          args: ./...
+
+      - name: Lint opt-in profiles
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version-file: .golangci-lint-version
+          args: --build-tags=rabiv_integration,rabiv_vmtest ./...
